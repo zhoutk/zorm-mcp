@@ -14,8 +14,8 @@
 ## 构建
 
 ```bash
-cmake --preset clang-rlz && cmake --build build --target zorm_mcp_server
-# exe 与运行 DLL 自动落在 build/zorm-mcp/（或 build/bin/，随构建树）
+cmake -S . -B build -G Ninja && cmake --build build
+# exe 与运行 DLL 落在 build/bin/
 # DLL 按依赖闭包解析（后端 DLL + libc++/libmariadb 及其传递依赖），客户端无需 MSYS2 PATH
 ```
 
@@ -29,17 +29,17 @@ cmake --preset clang-rlz && cmake --build build --target zorm_mcp_server
 
 ```bash
 # Claude Code（最简：内置 sqlite3 + jsonfile，默认库文件落在本目录）
-claude mcp add zorm-mcp -- D:/codes/zorm/zorm-mcp/start.sh
+claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh
 
 # 推荐：--config 显式指定数据库（模板见 zorm-mcp.json，connString 写绝对路径）
-claude mcp add zorm-mcp -- D:/codes/zorm/zorm-mcp/start.sh --config D:/codes/zorm/zorm-mcp/zorm-mcp.json
+claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh --config D:/codes/mcp/zorm-mcp/zorm-mcp.json
 ```
 
 ```jsonc
 // 其他客户端通用形态（各客户端配置文件位置见 INTEGRATION.md）
 { "mcpServers": { "zorm-mcp": {
-    "command": "D:/codes/zorm/zorm-mcp/start.sh",
-    "args": ["--config", "D:/codes/zorm/zorm-mcp/zorm-mcp.json"]
+    "command": "D:/codes/mcp/zorm-mcp/start.sh",
+    "args": ["--config", "D:/codes/mcp/zorm-mcp/zorm-mcp.json"]
 } } }
 ```
 

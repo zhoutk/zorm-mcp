@@ -1,8 +1,8 @@
 # demo/CMakeLists.txt - zorm showcase executables.
 #
 # zorm is the protagonist; mcp-cpp is the third-party MCP protocol library
-# it links (like any other consumer would). Built only when the zorm root
-# CMakeLists includes this directory (TARGET mcp present).
+# it links (like any other consumer would). Included by the parent (standalone
+# zorm-mcp) CMakeLists, which resolves the sibling zorm checkout.
 #
 # Targets:
 #   zorm_server             single-backend minimal MCP server (four tools)
@@ -40,7 +40,7 @@ if(TARGET gtest)
   # (ctest ENVIRONMENT escaping proved unreliable for PATH on Windows).
   if(WIN32)
     target_compile_definitions(mcp_test_zorm_analytics PRIVATE
-        ZORM_DLL_DIR="${CMAKE_SOURCE_DIR}/thirds/bin/win10")
+        ZORM_DLL_DIR="${ZORM_THIRDS_DLL_DIR}")
   endif()
   add_test(NAME mcp_test_zorm_analytics COMMAND mcp_test_zorm_analytics
       WORKING_DIRECTORY $<TARGET_FILE_DIR:mcp_test_zorm_analytics>)

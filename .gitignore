@@ -1,0 +1,12 @@
+build/
+build-*/
+bin/
+Testing/
+out/
+.vs/
+.vscode/
+**/.DS_Store
+*.db
+*.json
+!zorm-mcp.json
+demo/zorm-mcp/

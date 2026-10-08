@@ -8,12 +8,12 @@
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT="$SCRIPT_DIR/.."
 
-export PATH="$ROOT/thirds/bin/win10:$PATH"
+export PATH="$ROOT/../zorm/thirds/bin/win10:$PATH"
 EXE="$ROOT/build/demo/zorm_analytics_server.exe"
 
 if [ ! -x "$EXE" ]; then
   echo "[demo] zorm_analytics_server not found - build first:"
-  echo "  cmake --preset clang-rlz && cmake --build build --target zorm_analytics_server"
+  echo "  cmake -S . -B build -G Ninja && cmake --build build"
   exit 1
 fi
 

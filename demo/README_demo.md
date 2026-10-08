@@ -1,6 +1,6 @@
 # Zorm Analytics MCP — 演示操作指南
 
-> **正式版已落地**：本演示验证的架构已产品化为仓库根目录的 [`zorm-mcp/`](../zorm-mcp/README.md)（13 工具全 Idb 覆盖 + catalog 级表结构元数据 + 事务/只读 SQL 闸门）。接入配置见 [`zorm-mcp/INTEGRATION.md`](../zorm-mcp/INTEGRATION.md)。本文档保留为演示剧本与 Windows 完整性级别 FAQ 的权威说明。
+> **正式版已落地**：本演示的架构已产品化为本仓库的正式版 server（见 [README.md](../README.md) 与 [INTEGRATION.md](../INTEGRATION.md)）。本文档保留为演示剧本与 Windows 完整性级别 FAQ 的权威说明。
 
 **一句话**：让 AI 用自然语言同时操作多种异构数据库（sqlite / jsonfile 开箱即用，mysql / postgres / dm8 加配置即用），全程不懂任何 SQL 方言——这正是 zorm（统一 ORM 语义层）+ mcp-cpp（官方缺位的 C++ MCP SDK）的组合价值。
 
@@ -58,14 +58,14 @@ demo\run-demo.cmd
 先构建并初始化（一次性）：
 
 ```cmd
-cmake --preset clang-rlz && cmake --build build --target zorm_analytics_server
+cmake -S . -B build -G Ninja && cmake --build build
 build\demo\zorm_analytics_server.exe --setup
 ```
 
 ### Claude Code
 
 ```bash
-claude mcp add zorm-analytics -- D:/codes/zorm/build/demo/zorm_analytics_server.exe
+claude mcp add zorm-analytics -- D:/codes/mcp/zorm-mcp/build/demo/zorm_analytics_server.exe
 ```
 
 然后在会话里直接说：
@@ -81,7 +81,7 @@ AI 会自动：发现表 → 读 schema → 智能查询跨库 → 发起写入 
   "mcp": {
     "servers": {
       "zorm-analytics": {
-        "command": "D:/codes/zorm/build/demo/zorm_analytics_server.exe"
+        "command": "D:/codes/mcp/zorm-mcp/build/demo/zorm_analytics_server.exe"
       }
     }
   }
@@ -105,8 +105,8 @@ DeepSeek Harness 使用 MCP SDK 2.0（协议 2026-07-28），是**严格客户�
       config:
         serverName: zorm-analytics
         transport: stdio
-        command: D:/codes/zorm/build/demo/zorm_analytics_server.exe
-        cwd: D:/codes/zorm
+        command: D:/codes/mcp/zorm-mcp/build/demo/zorm_analytics_server.exe
+        cwd: D:/codes/mcp/zorm-mcp
 ```
 
    `cwd` 指到仓库根目录，server 打开的就是根目录下的 `demo.db` / `demo.json`。
