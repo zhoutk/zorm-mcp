@@ -15,6 +15,8 @@
 
 #include <mcp/mcp.hpp>
 
+#include "DbBase.h"  // ZORM::DbBase - pre-creating the scratch table before spawn
+
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -207,6 +209,21 @@ struct PipeTransport final : ITransport {
 
 const char* kE2eTable = "t_e2e";
 
+// The server registers the db://schema/{db}/{table} resources once, at startup,
+// from the tables that exist then - a table created later in the session is not
+// served through that resource until a restart. So the scratch table must exist
+// in the sqlite file BEFORE the child is spawned; otherwise the suite only
+// passes when a previous run happened to leave it behind. This creates it with
+// the same library the server uses, in the same working directory.
+void precreateScratchTableOnDisk() {
+  ZORM::DbBase db("sqlite3", Json(R"({"connString":"zorm-mcp.db"})"));
+  Json rs = db.execSql(std::string("create table if not exists ") + kE2eTable +
+                       " (id varchar(32) primary key, name varchar(32), score double)");
+  if (rs["status"].toInt() != 200) {
+    ADD_FAILURE() << "could not pre-create " << kE2eTable << ": " << rs.toString();
+  }
+}
+
 // Builds {"db": dbName, ...extra} call arguments.
 Json argsWith(const char* dbName) {
   Json a;
@@ -345,6 +362,7 @@ TEST(ZormMcpE2E, DiscoverToolsListAndGating) {
 // ---- metadata: the "get table fields" capability ---------------------------------
 
 TEST(ZormMcpE2E, MetadataOnEmptyTable) {
+  precreateScratchTableOnDisk();          // the per-table resource is a startup snapshot
   Child child = spawnChild(false, true);  // --yes --allow-sql
   PipeTransport t(child);
   Client client("e2e", "1.0");
