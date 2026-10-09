@@ -12,7 +12,11 @@ third-party projects kept as git submodules:
 - `thirds/mcp-cpp` — the C++ MCP protocol library
 
 `demo/` is the earlier single-purpose validation showcase ("Zorm Analytics") that this product was
-extracted from; it still builds and its e2e test runs, but new work belongs in `src/`.
+extracted from; it still builds and its e2e test runs, but new work belongs in `src/`. It builds two
+servers: `zorm_analytics_server` (the multi-backend showcase) and `zorm_server` (a ~200-line
+single-backend **template** for "database as MCP server" — no `db` routing param, no MRTR gate, 4
+tools; its 2nd CLI arg is a JSON options object for `DbBase`, not a file path; it self-reports as
+`zorm-mini-mcp` to avoid colliding with the product's `zorm-mcp`).
 
 For zorm internals (backend/dialect architecture, `run-test`, the contract test suite), read
 `thirds/zorm/CLAUDE.md` — that submodule is a full independent repo.
@@ -64,7 +68,7 @@ protocol-faithful: do not modify it for application needs.
 | File | Role |
 | --- | --- |
 | `main.cpp` | Arg parsing, `loadSpecs`/`openBackends`/`discoverAllSchemas`, `buildServer()` (registers every tool/resource/prompt), stdio vs `--http` serving |
-| `app.hpp/.cpp` | Global `App` state: backend registry, schema cache, MRTR pending table; `listTables`/`describeTable` (dialect-routed catalogs) |
+| `app.hpp/.cpp` | Global `App` state (backend registry + `specs`, schema cache, MRTR pending table, `--yes`/`--allow-sql` flags, `weak_ptr<Server>` for write notifications), startup (`loadSpecs`/`openBackends`/`discoverAllSchemas`) and the dialect-routed catalogs behind `listTables`/`describeTable`. The three `type ==` chains are `sqlListTables` / `sqlPrimaryKeys` / `sqlDescribe`; none of this belongs in a tool handler |
 | `guide.hpp/.cpp` | The AI-comprehension layer: `instructionsText()` decision table, `playbookText()`, `db-playbook` prompt |
 | `json_util.hpp/.cpp` | zjson↔mcp-cpp bridging, `okStatus`, result envelopes, `rowVal`/`rowStr`, `validIdentifier` |
 | `meta_tools.cpp` | `db_list_tables` / `db_describe_table` / `db_indexes` / `db_info` |
@@ -72,6 +76,20 @@ protocol-faithful: do not modify it for application needs.
 | `sql_tools.cpp` | `db_query_sql` (read-only gate) / `db_trans` / `db_exec_sql` |
 | `resources.cpp` | `db://schema` (+ `{db}` / `{db}/{table}` URI **templates**) and `db://guide`, completion |
 | `tools.hpp` | Registration entry points + `stageWrite`/`executeWrite`/`inputRequiredConfirm` decls |
+
+Layout rules (why it is flat, and which files get a header):
+
+- A `.hpp` exists only where declarations are shared by **multiple TUs** (`app`, `json_util`,
+  `guide`, `tools`) — the header count equals real coupling, not module count. `tools.hpp` has no
+  `.cpp`: it is the wiring panel between `main` and the three tool TUs. `meta_tools.cpp` /
+  `data_tools.cpp` / `sql_tools.cpp` / `resources.cpp` need no header because `main` calls each
+  exactly once.
+- **No project header includes another project header.** Cross-module use happens only inside
+  `.cpp` files, so the layering (`main` → `tools`/`guide`/`app` → `json_util` → third-party) is
+  enforced by include direction — which is why the flat directory needs no subdirectories.
+- Split into subdirectories only when a header starts including another project header, when one
+  role outgrows ~3 files (the likely first case: the `type ==` dispatch chains in `app.cpp` become
+  `backends/<type>.cpp` behind a catalog interface), or when a second target reuses part of `src/`.
 
 Key architectural facts:
 

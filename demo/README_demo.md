@@ -65,7 +65,7 @@ bin\zorm_analytics_server.exe --setup
 ### Claude Code
 
 ```bash
-claude mcp add zorm-analytics -- D:/codes/mcp/zorm-mcp/bin/zorm_analytics_server.exe
+claude mcp add zorm-analytics -- D:/codes/zorm-mcp/bin/zorm_analytics_server.exe
 ```
 
 然后在会话里直接说：
@@ -81,7 +81,7 @@ AI 会自动：发现表 → 读 schema → 智能查询跨库 → 发起写入 
   "mcp": {
     "servers": {
       "zorm-analytics": {
-        "command": "D:/codes/mcp/zorm-mcp/bin/zorm_analytics_server.exe"
+        "command": "D:/codes/zorm-mcp/bin/zorm_analytics_server.exe"
       }
     }
   }
@@ -105,8 +105,8 @@ DeepSeek Harness 使用 MCP SDK 2.0（协议 2026-07-28），是**严格客户�
       config:
         serverName: zorm-analytics
         transport: stdio
-        command: D:/codes/mcp/zorm-mcp/bin/zorm_analytics_server.exe
-        cwd: D:/codes/mcp/zorm-mcp
+        command: D:/codes/zorm-mcp/bin/zorm_analytics_server.exe
+        cwd: D:/codes/zorm-mcp
 ```
 
    `cwd` 指到仓库根目录，server 打开的就是根目录下的 `demo.db` / `demo.json`。
@@ -124,7 +124,7 @@ DeepSeek Harness 使用 MCP SDK 2.0（协议 2026-07-28），是**严格客户�
 ### curl 冒烟（HTTP 模式）
 
 ```bash
-build\demo\zorm_analytics_server.exe --http 18099 --yes &
+bin\zorm_analytics_server.exe --http 18099 --yes &
 curl -s --noproxy '*' -X POST http://127.0.0.1:18099/mcp   -H "Content-Type: application/json" -H "Accept: application/json"   -H "MCP-Protocol-Version: 2026-07-28" -H "Mcp-Method: server/discover"   -d '{"jsonrpc":"2.0","id":"1","method":"server/discover","params":{"_meta":{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientCapabilities":{}}}}'
 ```
 
@@ -239,4 +239,55 @@ icacls "D:\tmp\demo.db" /setintegritylevel Low
 
 - **换一个低完整性可写的目录**：仓库 `build/` 等由工具链生成的目录树往往已被标为 Low，把库放那里即可无感写入（本演示在仓库根目录的 `demo.db` 即属此列）。
 - **让 Claude Code 的 MCP 服务器以正常完整性运行**（不走低完整性沙箱）：属进程启动层面配置，视客户端版本支持而定；若可关闭 Windows 子进程沙箱，则无需改任何文件 ACL。服务器对客户端回传确认的多种形态做了容错（`confirm`/`content`/`value`/`params` 嵌套或顶层 `approved`，及 `action: accept/decline`），详见 `demo-design.md` §MRTR。
-- **`SQLITE_READONLY`，写入失败，但文件可写、磁盘无只读、属性只有 `A`**：这是 Windows 的**完整性级别（Integrity Level）**问题，不是文件只读，也不是服务器 bug。Claude Code 在 Windows 上以**低完整性（Low integrity）**运行 MCP 服务器等原生子进程；低完整性进程**能读**普通（中完整性）文件、**不能写**（无"写升"）。于是查询/读表一切正常，只有写操作报 `SQLITE_READONLY`。**最容易触发的情形**：在 Claude Code 会话里用 `mkdir`/`! mkdir` 在 Windows 下新建一个目录（如 `D:\tmp`）并把 `demo.db` 放进去——新目录默认中完整性，低完整性服务器写不进去。修复：把库文件和所在目录的完整性级别降为 Low（`icacls /setintegritylevel Low`，见下一节「六」），或把库放到能被低完整性进程写入的位置。
+
+---
+
+## 七、附：最小模板 `zorm_server`（单后端四工具）
+
+仓库同时构建**两个** demo server，用途不同——容易混淆，这里说清：
+
+| | `bin/zorm_server.exe` | `bin/zorm_analytics_server.exe`（本文档主角） |
+| --- | --- | --- |
+| 定位 | **最小模板**（"database as MCP server" 的抄写样板） | 多后端能力展示 + 正式版前身 |
+| 源码 | `demo/zorm_server.cpp`（约 200 行） | `demo/zorm_analytics_server.cpp`（约 1700 行） |
+| 后端 | **单后端**，启动参数指定 | 多后端，工具带 `db` 路由参数 |
+| 工具 | 4 个（`db_select`/`db_insert`/`db_update`/`db_delete`） | 7 个（多出 `db_list_tables`/`db_count`/`db_exec_sql`） |
+| 写确认（MRTR） | ❌ 无，直接写 | ✅ `input_required` 确认 |
+| Resources / 补全 / 订阅通知 | ❌ | ✅ |
+| `--setup` / `--demo` / `--http` / `--config` | ❌ 无参数 | ✅ |
+| e2e 测试 | 无 | `mcp_test_zorm_analytics` |
+
+要给自己的库加一层 MCP，直接复制 `demo/zorm_server.cpp` 改；要看全能力读 analytics server；产品化版本在 `src/`。
+
+### 7.1 启动参数：第二个参数是 JSON，不是文件路径
+
+```bash
+bin/zorm_server.exe sqlite3
+bin/zorm_server.exe sqlite3 '{"connString":"D:/db/demo.db","parameterized":true}'
+bin/zorm_server.exe jsonfile '{"connString":"./data/db.json"}'
+bin/zorm_server.exe mysql   '{"db_host":"127.0.0.1","db_user":"u","db_pass":"p","connString":"mydb"}'
+```
+
+- **第一个参数**：后端类型 `sqlite3 | jsonfile | mysql | postgres | dm8`，大小写不敏感，非法值直接报错退出（不会崩）。
+- **第二个参数**：透传给 zorm `DbBase` 的 **JSON 选项对象**（`connString` 等），**不是数据库文件路径**。传裸路径**不报错**，而是静默退回默认库（sqlite3 下是匿名临时库，进程一退数据就没）——这是最容易踩的坑。
+
+注册到 AI 客户端（它自报的服务名是 `zorm-mini-mcp`，与正式版 `zorm-mcp` 不再冲突）：
+
+```json
+{ "servers": { "zorm-mini-mcp": {
+    "command": "D:/codes/zorm-mcp/bin/zorm_server.exe",
+    "args": ["sqlite3", "{\"connString\":\"D:/codes/zorm-mcp/demo.db\"}"] } } }
+```
+
+### 7.2 四个工具
+
+| 工具 | 入参 | 说明 |
+| --- | --- | --- |
+| `db_select` | `{tablename, fields?, lks?, ins?, page?, size?, sort?}` | 智能查询（保留字语义同 `db_query`） |
+| `db_insert` | `{tablename, data}` | 单行插入；同 id 即 upsert |
+| `db_update` | `{tablename, data, where:{"id": v}}` | **单行**更新 |
+| `db_delete` | `{tablename, where:{"id": v}}` | **单行**删除 |
+
+`where` 只接受 `{"id": value}`——zorm 的 `update`/`remove` 都是 id 定位（`buildUpdateSql` 缺 id 直接返回 `Param is wrong`）；写操作没有确认闸门，模板定位如此。
+
+> 上述行为已在 `sqlite3` 与 `jsonfile` 两个后端上实测验证（增删改查 + `fields` 投影全部成功）。
