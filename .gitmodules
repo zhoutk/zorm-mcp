@@ -1,6 +1,8 @@
 [submodule "thirds/zorm"]
 	path = thirds/zorm
 	url = ssh://git@10.0.0.3:33/zhoutk/zorm.git
+	branch = master
 [submodule "thirds/mcp-cpp"]
 	path = thirds/mcp-cpp
 	url = ssh://git@10.0.0.3:33/zhoutk/mcp-cpp.git
+	branch = master
