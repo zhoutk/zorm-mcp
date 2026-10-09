@@ -14,9 +14,25 @@
 ## 构建
 
 ```bash
-cmake -S . -B build -G Ninja && cmake --build build
-# exe 与运行 DLL 落在 build/bin/
+git submodule update --init --recursive   # 首次：拉取 thirds/ 下的第三方项目
+cmake --preset clang-rlz                  # Release（默认）
+cmake --build build -j 8
+ctest --test-dir build                    # e2e 测试（真实 stdio 子进程）
+# build/ 只放中间产物；最终可执行文件与运行 DLL 落在 bin/
 # DLL 按依赖闭包解析（后端 DLL + libc++/libmariadb 及其传递依赖），客户端无需 MSYS2 PATH
+```
+
+### 第三方依赖（`thirds/`，git submodule）
+
+| 子模块 | 内容 |
+| --- | --- |
+| `thirds/zorm` | zormlib + 后端 DLL + zjson（zorm 项目） |
+| `thirds/mcp-cpp` | MCP 协议库（mcp-cpp 项目） |
+
+两者都是**独立项目**：要改 zorm / mcp-cpp，请到它们自己的仓库里改并提交，然后在本项目中拉取新版本：
+
+```bash
+git submodule update --remote thirds/zorm thirds/mcp-cpp
 ```
 
 零依赖开箱即用：不配置时内置 `sqlite3`（当前目录 `zorm-mcp.db`）与 `jsonfile`（`zorm-mcp.json`）两个后端。

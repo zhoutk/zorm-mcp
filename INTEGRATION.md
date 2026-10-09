@@ -12,8 +12,10 @@
 ### 0.1 构建（一次性）
 
 ```bash
-cmake -S . -B build -G Ninja && cmake --build build
-# 产物: build/bin/zorm_mcp_server.exe（运行 DLL 已自动复制到同目录）
+git submodule update --init --recursive   # 首次：thirds/ 下的第三方项目（zorm、mcp-cpp）
+cmake --preset clang-rlz && cmake --build build
+# 产物: bin/zorm_mcp_server.exe（运行 DLL 已自动复制到同目录）
+# build/ 只放中间产物
 ```
 
 构建时 POST_BUILD 会解析 exe 的**完整依赖闭包**并复制到同目录：不只 `sqlite3.dll`/`libpq.dll`/`dmdpi.dll` 这些后端 DLL，还有 `libc++.dll`、`libmariadb.dll` 及它们的传递依赖（来自 `D:/msys64/clang64/bin`）。AI 客户端用**自己的环境**孵化 server（没有 MSYS2 PATH），所以这一步是"免配 PATH 直接接"的前提——否则子进程加载期即退出，客户端只看到 `Process exited with code 3221225781`（0xC0000135 `STATUS_DLL_NOT_FOUND`）。
@@ -26,7 +28,7 @@ AI 客户端各自决定子进程的工作目录（cwd），**MCP 协议对此�
 | --- | --- | --- |
 | **包装脚本（推荐，标准示范）** | `D:/codes/mcp/zorm-mcp/start.sh`（MSYS2/Git Bash） | 免配 cwd，默认库落在 `zorm-mcp/` 目录 |
 | 备选 | `D:/codes/mcp/zorm-mcp/start.cmd`（cmd 批处理，行为等价） | 客户端无法直接执行 .sh 时 |
-| 直接指 exe | `D:/codes/mcp/zorm-mcp/build/bin/zorm_mcp_server.exe` | 客户端支持配 cwd，或你用 `--config` 给绝对路径 |
+| 直接指 exe | `D:/codes/mcp/zorm-mcp/bin/zorm_mcp_server.exe` | 客户端支持配 cwd，或你用 `--config` 给绝对路径 |
 
 传参直接跟在后面，例如 `start.sh --allow-sql --config D:/data/zorm.json`。
 
@@ -187,9 +189,9 @@ Codex 会话内工具以 `zorm-mcp.db_query` 形态暴露。
 
 ```bash
 # stdio 模式
-npx @modelcontextprotocol/inspector D:/codes/mcp/zorm-mcp/build/bin/zorm_mcp_server.exe
+npx @modelcontextprotocol/inspector D:/codes/mcp/zorm-mcp/bin/zorm_mcp_server.exe
 # HTTP 模式（transport 选 Streamable HTTP，URL 填 http://127.0.0.1:18099/mcp）
-D:/codes/mcp/zorm-mcp/build/bin/zorm_mcp_server.exe --http 18099 --yes &
+D:/codes/mcp/zorm-mcp/bin/zorm_mcp_server.exe --http 18099 --yes &
 npx @modelcontextprotocol/inspector --transport http http://127.0.0.1:18099/mcp
 ```
 
@@ -200,7 +202,7 @@ UI 里可逐个调工具、看 resources / prompts（`db-playbook`）/ MRTR 确�
 `--http <port>` 起纯 Streamable HTTP 服务（不跑 stdio），端点 `http://127.0.0.1:<port>/mcp`，多 worker / 浏览器 Inspector / 远程客户端均可接：
 
 ```bash
-D:/codes/mcp/zorm-mcp/build/bin/zorm_mcp_server.exe --http 18099
+D:/codes/mcp/zorm-mcp/bin/zorm_mcp_server.exe --http 18099
 ```
 
 裸 curl 冒烟（新协议头镜像校验：`Mcp-Name` 必须等于 body 里的 `name`）：

@@ -6,10 +6,10 @@
 :: (e.g. start.cmd --config zorm-mcp.json --allow-sql).
 setlocal
 cd /d "%~dp0"
-set EXE=%~dp0build\bin\zorm_mcp_server.exe
+set EXE=%~dp0bin\zorm_mcp_server.exe
 if not exist "%EXE%" (
   echo [zorm-mcp] server not found: %EXE% 1>&2
-  echo [zorm-mcp] build it first: cmake -S . -B build -G Ninja ^&^& cmake --build build 1>&2
+  echo [zorm-mcp] build it first: cmake --preset clang-rlz ^&^& cmake --build build 1>&2
   exit /b 1
 )
 "%EXE%" %*

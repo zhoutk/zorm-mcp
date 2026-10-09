@@ -58,14 +58,14 @@ demo\run-demo.cmd
 先构建并初始化（一次性）：
 
 ```cmd
-cmake -S . -B build -G Ninja && cmake --build build
-build\demo\zorm_analytics_server.exe --setup
+cmake --preset clang-rlz && cmake --build build
+bin\zorm_analytics_server.exe --setup
 ```
 
 ### Claude Code
 
 ```bash
-claude mcp add zorm-analytics -- D:/codes/mcp/zorm-mcp/build/demo/zorm_analytics_server.exe
+claude mcp add zorm-analytics -- D:/codes/mcp/zorm-mcp/bin/zorm_analytics_server.exe
 ```
 
 然后在会话里直接说：
@@ -81,7 +81,7 @@ AI 会自动：发现表 → 读 schema → 智能查询跨库 → 发起写入 
   "mcp": {
     "servers": {
       "zorm-analytics": {
-        "command": "D:/codes/mcp/zorm-mcp/build/demo/zorm_analytics_server.exe"
+        "command": "D:/codes/mcp/zorm-mcp/bin/zorm_analytics_server.exe"
       }
     }
   }
@@ -105,7 +105,7 @@ DeepSeek Harness 使用 MCP SDK 2.0（协议 2026-07-28），是**严格客户�
       config:
         serverName: zorm-analytics
         transport: stdio
-        command: D:/codes/mcp/zorm-mcp/build/demo/zorm_analytics_server.exe
+        command: D:/codes/mcp/zorm-mcp/bin/zorm_analytics_server.exe
         cwd: D:/codes/mcp/zorm-mcp
 ```
 
@@ -131,7 +131,7 @@ curl -s --noproxy '*' -X POST http://127.0.0.1:18099/mcp   -H "Content-Type: app
 ### MCP Inspector（看协议细节；HTTP 模式下选 SSE/Streamable HTTP 传输并填 URL）
 
 ```bash
-npx @modelcontextprotocol/inspector build/demo/zorm_analytics_server.exe
+npx @modelcontextprotocol/inspector bin/zorm_analytics_server.exe
 ```
 
 UI 里可以逐个调用工具、读 Resources、观察 `input_required` 确认流。
@@ -164,7 +164,7 @@ UI 里可以逐个调用工具、读 Resources、观察 `input_required` 确认�
 
 ## 五、常见问题
 
-- **报找不到 DLL（LIBPQ.dll 等）**：构建时已自动把运行 DLL 复制到 exe 同目录（`build/demo/`），正常无感；若手动搬移 exe，请连 DLL 一起带或用 `run-demo.cmd`/`run-demo.sh` 启动。
+- **报找不到 DLL（LIBPQ.dll 等）**：构建时已自动把运行 DLL 复制到 exe 同目录（`bin/`），正常无感；若手动搬移 exe，请连 DLL 一起带或用 `run-demo.cmd`/`run-demo.sh` 启动。
 - **AI 客户端显示连接失败**：确认用的是最新构建——服务器现在支持 legacy `initialize` 握手（Claude Code/VS Code 的接入方式）与无 `_meta` 请求，协议版本 2024-11-05 全系支持。改代码后需重新构建并重启 AI 客户端会话。
 - **严格客户端（DeepSeek Harness / MCP SDK 2.0+）报 `Invalid result for tools/list: ttlMs expected number`**：2026-07-28 规范要求 `*/list` 与 `resources/read` 结果必带 `ttlMs`/`cacheScope`（CacheableResult），mcp-cpp 现已默认注入（`ttlMs 0`/`public`，`listCache(-1)` 显式退出）。旧构建缺这两个字段，宽容客户端（Claude Code）不校验所以无感——重新构建 server 即可。
 - **演示数据想重置**：删除 `demo.db` 与 `demo.json` 后重跑 `--setup`。

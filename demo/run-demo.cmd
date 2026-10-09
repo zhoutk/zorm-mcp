@@ -8,15 +8,15 @@ rem 其余参数原样透传给 zorm_analytics_server --demo。
 setlocal
 set SCRIPT_DIR=%~dp0
 set ROOT=%SCRIPT_DIR%..
-set PATH=%ROOT%\..\zorm\thirds\bin\win10;%PATH%
+set PATH=%ROOT%\thirds\zorm\thirds\bin\win10;%PATH%
 
-if not exist "%SCRIPT_DIR%..\build\demo\zorm_analytics_server.exe" (
+if not exist "%ROOT%\bin\zorm_analytics_server.exe" (
   echo [demo] zorm_analytics_server.exe not found - build first:
-  echo   cmake -S . -B build -G Ninja ^&^& cmake --build build
+  echo   cmake --preset clang-rlz ^&^& cmake --build build
   exit /b 1
 )
 
-"%SCRIPT_DIR%..\build\demo\zorm_analytics_server.exe" --setup
+"%ROOT%\bin\zorm_analytics_server.exe" --setup
 if errorlevel 1 exit /b 1
-"%SCRIPT_DIR%..\build\demo\zorm_analytics_server.exe" --demo %*
+"%ROOT%\bin\zorm_analytics_server.exe" --demo %*
 endlocal

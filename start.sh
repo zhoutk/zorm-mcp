@@ -5,13 +5,13 @@
 # spawns the server from. All arguments pass through to the server.
 set -euo pipefail
 cd "$(dirname "$0")"
-EXE="$(dirname "$0")/build/bin/zorm_mcp_server"
+EXE="$(dirname "$0")/bin/zorm_mcp_server"
 if [[ "$(uname -s)" == MINGW* || "$(uname -s)" == MSYS* || -f "${EXE}.exe" ]]; then
   EXE="${EXE}.exe"
 fi
 if [[ ! -x "$EXE" && ! -f "$EXE" ]]; then
   echo "[zorm-mcp] server not found: $EXE" >&2
-  echo "[zorm-mcp] build it first: cmake -S . -B build -G Ninja && cmake --build build" >&2
+  echo "[zorm-mcp] build it first: cmake --preset clang-rlz && cmake --build build" >&2
   exit 1
 fi
 exec "$EXE" "$@"

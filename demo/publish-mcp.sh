@@ -36,7 +36,7 @@
 # 用法：
 #   ./demo/publish-mcp.sh                 # 发布到 <脚本目录>/zorm-mcp
 #   ./demo/publish-mcp.sh --dir D:/x/zorm-mcp
-#   ./demo/publish-mcp.sh --exe build/demo/zorm_analytics_server.exe  # 自定义 exe 路径
+#   ./demo/publish-mcp.sh --exe bin/zorm_analytics_server.exe  # 自定义 exe 路径
 #   ./demo/publish-mcp.sh --smoke false   # 跳过裸机冒烟验证
 # =============================================================================
 set -eu
@@ -44,7 +44,7 @@ set -eu
 # ---- 默认值 ---------------------------------------------------------------
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 ROOT="$SCRIPT_DIR/.."
-EXE="$ROOT/build/demo/zorm_analytics_server.exe"
+EXE="$ROOT/bin/zorm_analytics_server.exe"
 OUT_DIR="$SCRIPT_DIR/zorm-mcp"
 SMOKE=1
 
@@ -71,7 +71,7 @@ echo "   server : $EXE"
 echo "   发布到 : $OUT_DIR"
 
 # ---- 前置检查 -------------------------------------------------------------
-[ -f "$EXE" ] || { echo "[publish] 找不到 server: $EXE （先构建: cmake -S . -B build -G Ninja && cmake --build build）" >&2; exit 1; }
+[ -f "$EXE" ] || { echo "[publish] 找不到 server: $EXE （先构建: cmake --preset clang-rlz && cmake --build build）" >&2; exit 1; }
 command -v ldd >/dev/null 2>&1 || { echo "[publish] 需要 MSYS2 的 ldd 做依赖收集（本机 MSYS2 自带）" >&2; exit 1; }
 file "$EXE" | grep -qi "PE32+.*x86-64" || { echo "[publish] 只支持 64 位 Windows 发布（PE32+ x86-64）" >&2; exit 1; }
 
