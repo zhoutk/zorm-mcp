@@ -29,11 +29,14 @@ ctest --test-dir build                    # e2e 测试（真实 stdio 子进程�
 | `thirds/zorm` | zormlib + 后端 DLL + zjson（zorm 项目） |
 | `thirds/mcp-cpp` | MCP 协议库（mcp-cpp 项目） |
 
-两者都是**独立项目**：要改 zorm / mcp-cpp，请到它们自己的仓库里改并提交，然后在本项目中拉取新版本：
+两者都是**独立项目**（各自有远端仓库）：要改 zorm / mcp-cpp，直接进对应子模块目录改并提交推送（那里就是完整仓库），然后回到本项目记录新版本：
 
 ```bash
-git submodule update --remote thirds/zorm thirds/mcp-cpp
+cd thirds/zorm && git add -A && git commit -m "..." && git push   # 在子项目里改
+cd ../.. && ./sync-thirds.sh      # 拉取最新 master 并提交子模块指针变更
 ```
+
+`sync-thirds.sh` 等价于 `git submodule update --remote --merge thirds/zorm thirds/mcp-cpp` 加上自动提交指针变更。子模块已在 master 分支上跟踪各自远端（`.gitmodules` 的 `branch = master`）。
 
 零依赖开箱即用：不配置时内置 `sqlite3`（当前目录 `zorm-mcp.db`）与 `jsonfile`（`zorm-mcp.json`）两个后端。
 
@@ -77,7 +80,16 @@ claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh --config D:/codes/mcp/
 | `db_trans` {db, sqls} | ✅MRTR | transGo | 原子事务：`{text|sql, values}` 或结构化 `{table, method, params, id}` |
 | `db_exec_sql` {db, sql} | ✅MRTR | execSql | 任意写/DDL SQL，**`--allow-sql` 才注册** |
 
-配套 MCP 能力：`db://schema`（资源：总览 / 每库 / 每表完整列元数据）、`db://guide` + `db-playbook` prompt（用法手册）、completion（db/table/fields 补全）。
+配套 MCP 能力：
+
+| 资源 | 形态 | 说明 |
+| --- | --- | --- |
+| `db://guide` | 固定 | 完整用法手册（拉取层兜底） |
+| `db://schema` | 固定 | 全部后端总览 |
+| `db://schema/{db}` | **URI 模板** | 该后端的表清单 |
+| `db://schema/{db}/{table}` | **URI 模板** | 单表完整列元数据（type/nullable/pk），空表同样可用 |
+
+参数化 URI 以 **URI 模板**（`resources/templates/list`）注册，读时按模板实时匹配——**运行期新建的表无需重启 server 即可读取**（不是启动快照）。另有 `db-playbook` prompt（用法手册）与 completion（db/table/fields 补全）。
 
 ## 让 AI 用对工具：四层理解设计
 

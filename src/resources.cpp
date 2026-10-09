@@ -5,9 +5,10 @@
 //   db://schema/{db}             table list of one backend
 //   db://schema/{db}/{table}     full column metadata (type/nullable/pk)
 //
-// Per-table resources are registered from the startup schema discovery;
-// handlers describe on demand, so tables created later still resolve (and
-// write tools ping subscribers with notifyResourceUpdated).
+// The two parametric forms are registered as URI templates (resources/
+// templates/list), so every table - including one created at runtime - is
+// readable without a restart; the handler discovers tables live. Write tools
+// additionally ping subscribers with notifyResourceUpdated.
 
 #include "app.hpp"
 #include "guide.hpp"
@@ -155,22 +156,15 @@ void registerResourcesAndCompletion(Builder& b) {
              resourceGuide);
   b.resource(Json(R"({"uri":"db://schema","name":"all backends overview"})"),
              resourceSchema);
-  for (const auto& [dbName, spec] : app().specs) {
-    std::string err;
-    b.resource(Json::ParseJson(
-                   "{\"uri\":\"db://schema/" + dbName +
-                       "\",\"name\":\"tables in " + dbName + "\"}",
-                   err),
-               resourceSchema);
-    for (const auto& t : listTables(dbName)) {
-      std::string err2;
-      b.resource(Json::ParseJson(
-                     "{\"uri\":\"db://schema/" + dbName + "/" + t +
-                         "\",\"name\":\"schema of " + dbName + "." + t + "\"}",
-                     err2),
-                 resourceSchema);
-    }
-  }
+  // Parametric URIs are URI templates, not per-table registrations: the table
+  // set is discovered live by the handler, so a table created at runtime is
+  // readable immediately (no restart, no stale startup snapshot).
+  b.resourceTemplate(
+      Json(R"({"uriTemplate":"db://schema/{db}","name":"tables in one backend"})"),
+      resourceSchema);
+  b.resourceTemplate(
+      Json(R"({"uriTemplate":"db://schema/{db}/{table}","name":"schema of one table"})"),
+      resourceSchema);
   b.completions(toolCompletion);
 }
 

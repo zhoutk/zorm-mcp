@@ -15,8 +15,6 @@
 
 #include <mcp/mcp.hpp>
 
-#include "DbBase.h"  // ZORM::DbBase - pre-creating the scratch table before spawn
-
 #include <gtest/gtest.h>
 
 #include <cstdio>
@@ -209,21 +207,6 @@ struct PipeTransport final : ITransport {
 
 const char* kE2eTable = "t_e2e";
 
-// The server registers the db://schema/{db}/{table} resources once, at startup,
-// from the tables that exist then - a table created later in the session is not
-// served through that resource until a restart. So the scratch table must exist
-// in the sqlite file BEFORE the child is spawned; otherwise the suite only
-// passes when a previous run happened to leave it behind. This creates it with
-// the same library the server uses, in the same working directory.
-void precreateScratchTableOnDisk() {
-  ZORM::DbBase db("sqlite3", Json(R"({"connString":"zorm-mcp.db"})"));
-  Json rs = db.execSql(std::string("create table if not exists ") + kE2eTable +
-                       " (id varchar(32) primary key, name varchar(32), score double)");
-  if (rs["status"].toInt() != 200) {
-    ADD_FAILURE() << "could not pre-create " << kE2eTable << ": " << rs.toString();
-  }
-}
-
 // Builds {"db": dbName, ...extra} call arguments.
 Json argsWith(const char* dbName) {
   Json a;
@@ -362,7 +345,6 @@ TEST(ZormMcpE2E, DiscoverToolsListAndGating) {
 // ---- metadata: the "get table fields" capability ---------------------------------
 
 TEST(ZormMcpE2E, MetadataOnEmptyTable) {
-  precreateScratchTableOnDisk();          // the per-table resource is a startup snapshot
   Child child = spawnChild(false, true);  // --yes --allow-sql
   PipeTransport t(child);
   Client client("e2e", "1.0");
@@ -384,10 +366,19 @@ TEST(ZormMcpE2E, MetadataOnEmptyTable) {
   EXPECT_NE(cols[2]["type"].toString().find("double"), std::string::npos);
   EXPECT_TRUE(cols[1]["nullable"].isTrue());
 
-  // Per-table resource reads the same metadata.
+  // Per-table resource reads the same metadata. The table was created AFTER the
+  // server started, so this only works because the parametric URIs are URI
+  // templates resolved live - not a startup snapshot.
   auto res = client.readResource("db://schema/sqlite3/t_e2e");
-  ASSERT_TRUE(res.has_value());
+  ASSERT_TRUE(res.has_value()) << res.error().message;
   EXPECT_NE((*res).toString().find("primary key"), std::string::npos);
+
+  // The templates are advertised for client discovery.
+  auto tmpls = client.listResourceTemplates();
+  ASSERT_TRUE(tmpls.has_value()) << tmpls.error().message;
+  const std::string tmplText = (*tmpls).toString();
+  EXPECT_NE(tmplText.find("db://schema/{db}"), std::string::npos);
+  EXPECT_NE(tmplText.find("db://schema/{db}/{table}"), std::string::npos);
 
   // db_list_tables + db_indexes + db_info.
   auto tables = client.callTool("db_list_tables", Json(R"({"db":"sqlite3"})"));

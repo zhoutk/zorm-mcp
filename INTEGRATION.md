@@ -18,6 +18,8 @@ cmake --preset clang-rlz && cmake --build build
 # build/ 只放中间产物
 ```
 
+依赖更新：zorm / mcp-cpp 是独立项目（`thirds/` 下的 git submodule），在它们自己的仓库里改完推送后，回到本目录执行 `./sync-thirds.sh` 拉取最新 master 并提交指针变更（详见 README「第三方依赖」）。
+
 构建时 POST_BUILD 会解析 exe 的**完整依赖闭包**并复制到同目录：不只 `sqlite3.dll`/`libpq.dll`/`dmdpi.dll` 这些后端 DLL，还有 `libc++.dll`、`libmariadb.dll` 及它们的传递依赖（来自 `D:/msys64/clang64/bin`）。AI 客户端用**自己的环境**孵化 server（没有 MSYS2 PATH），所以这一步是"免配 PATH 直接接"的前提——否则子进程加载期即退出，客户端只看到 `Process exited with code 3221225781`（0xC0000135 `STATUS_DLL_NOT_FOUND`）。
 
 ### 0.2 接入命令用哪个：**统一用 `start.sh` 包装脚本（推荐，MSYS2 标准示范）**
