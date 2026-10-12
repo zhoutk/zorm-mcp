@@ -5,6 +5,7 @@ Testing/
 out/
 .vs/
 .vscode/
+.serena/
 **/.DS_Store
 *.db
 *.json
