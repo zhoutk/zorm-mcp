@@ -577,6 +577,104 @@ gantt
 
 ---
 
+## 9. 回归验证（2026-10-22，改造后实测）
+
+> 本节是对 §8 实施结果的一次**独立复测**：重新构建当前 HEAD（`fd7727d`，版本 1.1.1），
+> 用真实 HTTP MCP 实例对 sqlite3 / jsonfile / mysql(8.3.0) / postgres(14.12) / dm8(V8)
+> 五个后端逐项复跑 §2.2 的全部缺陷路径与原有功能面。
+
+### 9.1 验证方法
+
+| 通道 | 内容 |
+| --- | --- |
+| 构建 | `cmake --build build`（`ninja: no work to do`，二进制 12:39 晚于源码） |
+| CTest | 3/3 套件（e2e 17 个用例、unit 11 个用例、demo） |
+| 远端矩阵 | `ZORM_MCP_REMOTE_CONFIG=<五后端配置> mcp_test_zorm_mcp --gtest_filter=ZormMcpE2E.RemoteBackendsMatrix` |
+| 协议级实测 | 6 个临时实例：`--yes`(18300)、MRTR(18301)、`--allow-sql`(18303)、Bearer(18304)、默认配置(18305)、配置误用拒绝(18306) |
+| 断言方式 | 脚本化 JSON-RPC 断言（每项检查都是一次真实 `tools/call`），逐项打印 PASS/FAIL |
+| zorm 门 | `cd thirds/zorm && ./run-test all` |
+
+### 9.2 结果总览
+
+| 套件 | 检查项 | 通过 | 失败 |
+| --- | --- | --- | --- |
+| core（连通性 / 元数据 / 查询 / SQL 闸门 / 写 / 事务 / 资源） | 88 | 88 | 0 |
+| injection（D-02 表名 + 全结构化标识符 + 破坏性载荷） | 77 | 77 | 0 |
+| mrtr（stage/批准/拒绝/重放/伪造/跨工具/跨 principal/降级） | 13 | 13 | 0 |
+| auth（401 / 200 / principal 绑定） | 5 | 5 | 0 |
+| default（D-01 默认库与配置识别） | 3 | 3 | 0 |
+| protocol（legacy + modern + 缓存字段 + 32 并发） | 7 | 7 | 0 |
+| allow-sql（13 工具 + DDL/DML + 标识符闸门仍生效） | 6 | 6 | 0 |
+| extras（跨方言边角：jsonfile lks、pg 事务字面量、别名聚合） | 10 | 10 | 0 |
+| final（dm8 事务、fuzzy、自纠错文案、注入补充） | 8 | 8 | 0 |
+| **合计** | **217** | **217** | **0** |
+| CTest | 3 套件 | 3 | 0 |
+| 远端矩阵 gtest | 1 | 1 | 0 |
+| zorm `run-test all` | 13 | 13 | 0 |
+
+### 9.3 缺陷关闭核对
+
+| 编号 | 复测证据 | 结论 |
+| --- | --- | --- |
+| **D-01** | 默认配置下 jsonfile 首写成功、读回一致，落盘文件为 `zorm-mcp-data.json`；把配置形状的 JSON 当库时启动即退出并打印 `refusing to use it as a database`（exit=1）；全程未产生 `*.corrupt.*` | ✅ 关闭 |
+| **D-02** | 9 种非法表名 × 6 个工具（query/count/insert/update/delete/describe）全部返回 `invalid table name`；`fields/group/sort/条件键/lks/ins/ors/sum 源与别名/count/data 键/rows 键/constraint/where 键/事务 table 与 params 键/事务 method` 共 19 类注入全部拒绝；原破坏载荷 `second_table where 1=1 or id = $1 --` 被拒后 `second_table` 数据完好 | ✅ 关闭 |
+| **D-03** | `ins:{age:[18,20]}` 在 mysql / postgres / dm8 / sqlite 均返回 2 行（18、20），SQL 为 `col,v1,v2` 单列多值 | ✅ 关闭 |
+| **D-04** | MySQL `table_for_test.id`（DDL `NOT NULL`）返回 `nullable: false`；postgres/dm8 保持一致 | ✅ 关闭 |
+| **D-05** | `count:"*,total"` → `[{"total":6}]`；`count:{"*":"total"}` 同结果；`sum:"score,total"` → `{"total":583.29}`；sqlite 上同样正确；`count` schema 已接受 object | ✅ 关闭 |
+| **D-06** | dm8 `db_delete where:{}` 成功，删除后 `db_query` 返回空 | ✅ 关闭 |
+| **D-07** | 同一段 `?` 绑定 SQL 在 mysql / sqlite / dm8 / postgres 均返回正确行；pg `$n` 仍可用；字面量内的 `?`（`'q?mark'`、`'a?b'`）不被改写；占位符与 `values` 数量不符时明确报错 | ✅ 关闭 |
+| **D-08** | MySQL `explain select * from table_for_test` 返回执行计划；postgres 同 | ✅ 关闭（dm8 见 §9.5） |
+| **D-09** | dm8 `db_list_tables` 不再包含 `##HISTOGRAMS_TABLE` 等非简单标识符；清单内 17 张表逐一 `db_describe_table` 全部成功 | ✅ 关闭 |
+| **D-10** | `size:2` 单独使用按 page 1 返回 2 行且 `pages=3`；`page` 单独使用报 `page requires size`；`size` 越界由 schema（1..500）拒绝 | ✅ 关闭 |
+| **D-11** | `/* c */ select 1`、`-- note\nselect 2` 均通过；`/* c */ delete from ...` 仍被 READ-ONLY 拒绝；多语句仍拒绝 | ✅ 关闭 |
+| **D-12** | dm8 写结果同时带 `affected` 与 `affectedRows`；dm8 `count` 为 JSON 数字；批量结果无 `insertId`；服务型后端错误不再附 `[file:]`，文件型后端仍保留；dm8 错误文本为可读 UTF-8（`第1 行附近出现错误`） | ✅ 关闭 |
+| **O-01** | 32 个并发混合查询（4 后端、含 sort/fields/ins/group）零错误、零参数串台 | ✅ 无回归；文档建议保留 |
+| **O-02** | `arguments.inputResponses`（不带 state）回退到最近 pending 并成功执行；guide/playbook 已写明该降级通道 | ✅ 关闭（文档） |
+
+### 9.4 未受影响功能的回归
+
+以下原有能力在改造后逐项复测通过：五后端 `db_info` 版本探测、空表 catalog 元数据、
+`db_indexes` 四方言、`fields` 投影、比较前缀、`lks`（含中文）、`ors`、`group+sum`、
+`sort` 字符串/数组、`page+size`、`db_count`（含 where）、只读 SQL 闸门（SELECT/WITH/SHOW/
+DESCRIBE/PRAGMA/JOIN/EXPLAIN）、`db_insert` upsert、`db_insert_batch`、`db_update`、
+`db_delete`（id / 全表）、`db_trans`（文本 + 结构化 + 回滚原子性）、`db_exec_sql`（仅在
+`--allow-sql`）、`resources/list`、URI 模板、`prompts/list`、legacy `initialize` 与
+modern `server/discover`、`Mcp-Name` 镜像校验、缓存字段、JSON-RPC 批处理拒绝。
+
+### 9.5 复测中发现的残留项（不影响本次修复结论）
+
+1. **dm8 不支持 `EXPLAIN`**：`explain select ...` 返回可读错误 `执行未准备SQL语句 (-2002)`。
+   这是 DM 驱动/引擎限制，改造前同样失败（当时还是 GBK 乱码）。§8 的 D-08 只承诺 MySQL，
+   `docs/dialects.md §7` 已写"其它方言按各自支持面"，但未点名 dm8。建议补一句明确说明，
+   或在工具描述里标注 "EXPLAIN: mysql/postgres/sqlite"。
+2. **测试脚本自身的 4 处初判失败**（已逐项澄清，均非产品缺陷）：
+   - `size` 越界由 **tool schema** 先于 handler 拒绝，消息是 `/size: value ... exceeds maximum`，
+     断言原期望 handler 文案 → 行为正确，属断言过严；
+   - sqlite `?` 绑定初测"失败"实为 `t_e2e` 被 CTest 清空（0 行），补种数据后全部通过；
+   - dm8 EXPLAIN 见上条；
+   - `fields` 传字符串同样被 schema 先拒绝（`expected type array`），行为正确。
+3. **stdio 实机通道**：本次无法经 VS Code 的 MCP 客户端复测（会话内该工具已被禁用）；
+   stdio 由 CTest e2e 与 `RemoteBackendsMatrix`（均以真实子进程 + stdio 管道运行）覆盖。
+
+### 9.6 现场状态
+
+| 项 | 状态 |
+| --- | --- |
+| 临时实例（18300–18306） | 已 `taskkill`，`netstat` 复核 0 监听 |
+| 远端 `third_table` / `second_table` | 测试行全部清理，`db_count` 复核 mysql/postgres/dm8 均为 0；无 `rg_*` / `mc` 测试表残留 |
+| 本地 sqlite3 `t_e2e` | 恢复为回归前状态（0 行） |
+| jsonfile 测试库 | 位于临时目录，已随 `.tmp-regress/` 删除 |
+| 仓库工作区 | `git status` 干净；无 `*.corrupt.*`、无新增临时文件 |
+
+### 9.7 回归结论
+
+§2.2 的 **12 个缺陷全部关闭**，两个观察项（O-01 并发、O-02 批准通道文档）均已落地；
+217 项协议级检查、3 个 CTest 套件、远端矩阵与 zorm 13 项契约测试全部通过。
+**建议按 §6 的结论将版本推进到 1.1.1 发布**；唯一建议同步的收尾项是 §9.5-1 的 dm8
+EXPLAIN 说明（纯文档，不阻塞）。
+
+---
+
 ## 附录 A：复现命令速查
 
 ```bash
