@@ -435,36 +435,49 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
   ZORM::Idb* db = g.db(dbName);
   if (db == nullptr) return Err(McpErrorCode::InvalidParams, "unknown db: " + dbName + " (available: " + g.dbListText() + ")");
 
-  // MRTR retry detection. Clients are unreliable about echoing the exact
-  // shape we ask for, so a retry is ANY of:
-  //   - inputResponses present (object; shape-tolerant, see confirmApproved)
-  //   - requestState present (echoed token)
-  //   - a bare top-level "approved" argument (clients that reply in place)
-  // Anything else is a fresh stage.
-  const Json responses = member(args, "inputResponses");
-  const Json reqStateArg = member(args, "requestState");
-  const Json approvedArg = member(args, "approved");
+  // MRTR retry detection. Per the spec the retry carries requestState and
+  // inputResponses at the tools/call PARAMS level (siblings of `arguments`).
+  const Json rootResponses = member(c.params, "inputResponses");
+  const Json rootState = member(c.params, "requestState");
+  const Json rootApproved = member(c.params, "approved");
+  const Json responses = rootResponses.isObject() ? rootResponses : member(args, "inputResponses");
+  const Json reqStateArg = rootState.isString() ? rootState : member(args, "requestState");
+  const Json approvedArg =
+      (rootApproved.isTrue() || rootApproved.isFalse()) ? rootApproved : member(args, "approved");
   const bool isRetry = responses.isObject() || reqStateArg.isString() ||
                        approvedArg.isTrue() || approvedArg.isFalse();
   if (isRetry) {
     const bool approved = responses.isObject() ? confirmApproved(responses) : approvedArg.isTrue();
-    // Locate the pending op: prefer the echoed requestState; when the client
-    // dropped it, fall back to the pending op for THIS (db, table, kind) —
-    // with several staged (the client looping before confirming), the latest
-    // one wins, which is what the model was trying to confirm.
+    // Verify the sealed state (bound to this tool by mcp-cpp) and locate the
+    // pending op. A forged/expired/cross-tool token is rejected; the tuple
+    // fallback applies only when the client dropped the state entirely.
     std::string state;
     DemoServer::PendingOp op;
     bool found = false;
+    bool hadState = false;
     if (reqStateArg.isString()) {
-      const std::string s = reqStateArg.toString();
-      auto it = g.pending.find(s);
-      if (it != g.pending.end()) {
-        state = s;
-        op = it->second;
-        found = true;
+      hadState = true;
+      auto opened = c.openRequestState();
+      if (!opened.has_value())
+        return Err(McpErrorCode::InvalidParams,
+                   "requestState is invalid, expired, forged, or was issued for a "
+                   "different tool — call again without it to stage a new one");
+      if (opened->has_value()) {
+        auto it = g.pending.find(**opened);
+        if (it != g.pending.end()) {
+          state = **opened;
+          op = it->second;
+          found = true;
+        }
       }
+      if (!found)
+        return Err(McpErrorCode::InvalidParams,
+                   "requestState refers to no pending " + kind + " op for " +
+                   dbName + "." + table +
+                   " (already executed or expired) — call again without it to "
+                   "stage a new one");
     }
-    if (!found) {
+    if (!hadState) {
       int bestN = -1;
       for (const auto& [s, po] : g.pending) {
         if (po.db != dbName || po.table != table || po.kind != kind) continue;
@@ -477,12 +490,11 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
           found = true;
         }
       }
+      if (!found)
+        return Err(McpErrorCode::InvalidParams,
+                   "no pending " + kind + " op for " + dbName + "." + table +
+                   " — call again without approved/inputResponses to stage a new one");
     }
-    if (!found)
-      return Err(McpErrorCode::InvalidParams,
-                 "no pending " + kind + " op for " + dbName + "." + table +
-                 " (requestState " + reqStateArg.toString() +
-                 " is unknown or expired) — call again without approved/inputResponses to stage a new one");
     g.pending.erase(state);
     if (!approved) {
       Json result;
@@ -524,12 +536,18 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
         ++it;
     }
     g.pending[state] = {dbName, table, kind, args};
+    // Seal the internal id into the wire token (bound to this tool).
+    auto sealed = c.sealRequestState(state);
+    if (!sealed.has_value()) {
+      g.pending.erase(state);
+      return Err(sealed.error());
+    }
     // requestState 走确认文本: 严格文本客户端(只展示 content)也拿得到,
     // MRTR 重试时原样回传即可。
     const std::string msg = "Confirm " + kind + " on " + dbName + "." + table +
                             " (" + impact + ")? Reply with approved:true to proceed"
-                            " (requestState: " + state + ").";
-    return Ok(inputRequiredConfirm(state, msg));
+                            " (requestState: " + *sealed + ").";
+    return Ok(inputRequiredConfirm(*sealed, msg));
   }
   // --yes: execute immediately (tests / scripted demo).
   return executeWrite(dbName, table, kind, args);
@@ -800,11 +818,11 @@ void registerAll(Builder& b) {
          toolQuery);
   b.tool(Json(R"({"name":"db_count","description":"Count rows in a table.","inputSchema":{"type":"object","required":["db","table"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"where":{"type":"object"}}}})"),
          toolCount);
-  b.tool(Json(R"({"name":"db_insert","description":"Insert one row (requires confirmation).","inputSchema":{"type":"object","required":["db","table","data"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"data":{"type":"object"},"requestState":{"type":"string"},"inputResponses":{"type":"object"}}}})"),
+  b.tool(Json(R"({"name":"db_insert","description":"Insert one row (requires confirmation).","inputSchema":{"type":"object","required":["db","table","data"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"data":{"type":"object"}}}})"),
          toolInsert);
-  b.tool(Json(R"({"name":"db_update","description":"Update rows matching where (requires confirmation; where must carry id).","inputSchema":{"type":"object","required":["db","table","data","where"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"data":{"type":"object"},"where":{"type":"object"},"requestState":{"type":"string"},"inputResponses":{"type":"object"}}}})"),
+  b.tool(Json(R"({"name":"db_update","description":"Update rows matching where (requires confirmation; where must carry id).","inputSchema":{"type":"object","required":["db","table","data","where"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"data":{"type":"object"},"where":{"type":"object"}}}})"),
          toolUpdate);
-  b.tool(Json(R"({"name":"db_delete","description":"Delete rows matching where (requires confirmation). where:{\"id\": v} deletes that row; where:{} deletes ALL rows in the table. Other conditions (ins/lks/columns) are not supported - delete by id instead.","inputSchema":{"type":"object","required":["db","table","where"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"where":{"type":"object"},"requestState":{"type":"string"},"inputResponses":{"type":"object"}}}})"),
+  b.tool(Json(R"({"name":"db_delete","description":"Delete rows matching where (requires confirmation). where:{\"id\": v} deletes that row; where:{} deletes ALL rows in the table. Other conditions (ins/lks/columns) are not supported - delete by id instead.","inputSchema":{"type":"object","required":["db","table","where"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"where":{"type":"object"}}}})"),
          toolDelete);
   if (g.allowSql) {
     b.tool(Json(R"({"name":"db_exec_sql","description":"Execute parameterized SQL (dangerous; confirmation required).","inputSchema":{"type":"object","required":["db","sql"],"properties":{"db":{"type":"string"},"sql":{"type":"string"}}}})"),
@@ -902,6 +920,14 @@ std::shared_ptr<Server> buildServer() {
       .supports(ProtocolVersion::V2025_06_18)
       .supports(ProtocolVersion::V2025_11_25)
       .supports(ProtocolVersion::Latest);
+  // Writes publish resources/updated + list_changed (see executeWrite).
+  b.listChanged("resources").resourceSubscribe();
+  // mcp-cpp 0.4: integrity-protected MRTR state. The demo key is fixed
+  // because this is a local showcase; a deployment generates a per-process
+  // secret (see src/main.cpp).
+  auto codec = RequestStateCodec::create(
+      "zorm-analytics-demo-state-key-0123456789abcdef");
+  if (codec.has_value()) b.requestStateCodec(std::move(codec.value()));
   registerAll(b);
   auto server = b.build();
   g.server = server;
@@ -1416,7 +1442,6 @@ int runScriptedDemo(const std::shared_ptr<Server>&, bool autoMode) {
       thinking();
       auto ires = client.callTool("db_insert", iargs);
       if (ires.has_value() && (*ires)["resultType"].toString() == "input_required") {
-        const std::string state = (*ires)["requestState"].toString();
         if (firstRow) {
           std::cout << kGreen << "  -> 服务器请求确认 (MRTR)" << kReset << "\n";
           std::cout << kYellow << "  提示: " << kReset
@@ -1435,14 +1460,13 @@ int runScriptedDemo(const std::shared_ptr<Server>&, bool autoMode) {
         std::snprintf(sBuf, sizeof(sBuf), "%.2f", row["amount"].toDouble());
         ird.add("total_amount", Json::str(sBuf));
         iretry.add("data", std::move(ird));
-        iretry.add("requestState", Json::str(state));
         Json iresp;
         Json icf;
         icf.add("approved", Json(true));
         iresp.add("confirm", std::move(icf));
-        iretry.add("inputResponses", std::move(iresp));
         thinking();
-        auto isecond = client.callTool("db_insert", iretry);
+        auto isecond = client.retryToolCall("db_insert", iretry, *ires,
+                                            std::move(iresp));
         if (isecond.has_value()) {
           // executeWrite 返回成功(200/202)才算真正落盘; has_value() 只说明
           // MCP 响应正常, 写入可能被 zorm 拒绝(如文件被占用)。
@@ -1558,7 +1582,6 @@ int runScriptedDemo(const std::shared_ptr<Server>&, bool autoMode) {
   thinking();
   auto first = client.callTool("db_insert", args);
   if (first.has_value() && (*first)["resultType"].toString() == "input_required") {
-    const std::string state = (*first)["requestState"].toString();
     std::cout << kGreen << "  -> 服务器请求确认 (resultType=input_required)" << kReset << "\n";
     std::cout << kYellow << "  提示: " << kReset
               << (*first)["inputRequests"]["confirm"]["params"]["message"].toString() << "\n";
@@ -1574,14 +1597,13 @@ int runScriptedDemo(const std::shared_ptr<Server>&, bool autoMode) {
     data2.add("expensive_product_count", Json(expensiveCount));
     data2.add("expensive_product_total", Json::str(expTotalBuf));
     retry.add("data", std::move(data2));
-    retry.add("requestState", Json::str(state));
     Json responses;
     Json confirm;
     confirm.add("approved", Json(true));
     responses.add("confirm", std::move(confirm));
-    retry.add("inputResponses", std::move(responses));
     thinking();
-    auto second = client.callTool("db_insert", retry);
+    auto second = client.retryToolCall("db_insert", retry, *first,
+                                       std::move(responses));
     if (second.has_value() && second->isObject() &&
         second->contains("status") && (*second)["status"].toInt() == 200) {
       std::cout << kGreen << "  -> ok" << kReset << "  对比结论已写入 jsonfile.analytics (用户批准后真正落库)\n";
@@ -1651,7 +1673,6 @@ int runScriptedDemo(const std::shared_ptr<Server>&, bool autoMode) {
       thinking();
       auto delFirst = client.callTool("db_delete", delArgs);
       if (delFirst.has_value() && (*delFirst)["resultType"].toString() == "input_required") {
-        const std::string state = (*delFirst)["requestState"].toString();
         std::cout << kGreen << "  -> 请求确认删除 id=" << row["id"].toString() << kReset << "\n";
         pause(demoDelayMs() / 2);
         std::cout << kMagenta << "  用户点击『批准』" << kReset << "\n";
@@ -1661,13 +1682,12 @@ int runScriptedDemo(const std::shared_ptr<Server>&, bool autoMode) {
         Json where2;
         where2.add("id", Json::str(row["id"].toString()));
         delRetry.add("where", std::move(where2));
-        delRetry.add("requestState", Json::str(state));
         Json delResponses;
         Json delConfirm;
         delConfirm.add("approved", Json(true));
         delResponses.add("confirm", std::move(delConfirm));
-        delRetry.add("inputResponses", std::move(delResponses));
-        auto delSecond = client.callTool("db_delete", delRetry);
+        auto delSecond = client.retryToolCall("db_delete", delRetry, *delFirst,
+                                              std::move(delResponses));
         if (delSecond.has_value()) {
           std::cout << kGreen << "  -> 已删除 id=" << row["id"].toString() << kReset << "\n";
         } else {

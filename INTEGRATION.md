@@ -28,9 +28,9 @@ AI 客户端各自决定子进程的工作目录（cwd），**MCP 协议对此�
 
 | 形式 | 命令 | 适用 |
 | --- | --- | --- |
-| **包装脚本（推荐，标准示范）** | `D:/codes/mcp/zorm-mcp/start.sh`（MSYS2/Git Bash） | 免配 cwd，默认库落在 `zorm-mcp/` 目录 |
-| 备选 | `D:/codes/mcp/zorm-mcp/start.cmd`（cmd 批处理，行为等价） | 客户端无法直接执行 .sh 时 |
-| 直接指 exe | `D:/codes/mcp/zorm-mcp/bin/zorm_mcp_server.exe` | 客户端支持配 cwd，或你用 `--config` 给绝对路径 |
+| **包装脚本（推荐，标准示范）** | `D:/codes/zorm-mcp/start.sh`（MSYS2/Git Bash） | 免配 cwd，默认库落在 `zorm-mcp/` 目录 |
+| 备选 | `D:/codes/zorm-mcp/start.cmd`（cmd 批处理，行为等价） | 客户端无法直接执行 .sh 时 |
+| 直接指 exe | `D:/codes/zorm-mcp/bin/zorm_mcp_server.exe` | 客户端支持配 cwd，或你用 `--config` 给绝对路径 |
 
 传参直接跟在后面，例如 `start.sh --allow-sql --config D:/data/zorm.json`。
 
@@ -57,7 +57,8 @@ demo 是在项目目录里手工启动 server 的，库文件自然落在当时�
 
 ### 0.4 写确认（MRTR）与两个开关
 
-- 所有写工具（insert / insert_batch / update / delete / trans / exec_sql）**首次调用不执行**：返回 `input_required` + `requestState`，确认文案含目标库/表/影响行数。AI 会把确认请求转述给你，批准后自动带 `requestState + inputResponses` 重试落盘。
+- 所有写工具（insert / insert_batch / update / delete / trans / exec_sql）**首次调用不执行**：返回 `input_required` + `requestState`，确认文案含目标库/表/影响行数。AI 会把确认请求转述给你，批准后自动带 `requestState + inputResponses` 重试落盘（两者在 **tools/call params 层**，与 `arguments` 同级；MCP 客户端库会自动放置）。
+- `requestState` 是 HMAC 封装的不可编辑 token，绑定工具（HTTP 下还绑定 Bearer principal）：伪造/跨工具/跨账号/过期一律拒绝，重新发起写调用即可重新 stage。
 - `--yes` 关闭确认（自动化/测试专用）；`--allow-sql` 才会注册 `db_exec_sql`（任意写/DDL SQL）。
 - 客户端若支持 elicitation 会弹原生确认框；不支持时由 AI 转述，效果等价。
 
@@ -71,18 +72,18 @@ demo 是在项目目录里手工启动 server 的，库文件自然落在当时�
 
 ```bash
 # 最简接入：内置 sqlite3 + jsonfile，默认库文件落在 zorm-mcp/ 目录
-claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh
+claude mcp add zorm-mcp -- D:/codes/zorm-mcp/start.sh
 
 # 推荐：加 --config 显式指定数据库——位置/后端由配置决定，不随 cwd 漂移
-claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh --config D:/codes/mcp/zorm-mcp/zorm-mcp.json
+claude mcp add zorm-mcp -- D:/codes/zorm-mcp/start.sh --config D:/codes/zorm-mcp/zorm-mcp.json
 ```
 
 项目级共享配置（签入仓库，团队共用）——在仓库根建 `.mcp.json`：
 
 ```json
 { "mcpServers": { "zorm-mcp": {
-    "command": "D:/codes/mcp/zorm-mcp/start.sh",
-    "args": ["--config", "D:/codes/mcp/zorm-mcp/zorm-mcp.json"]
+    "command": "D:/codes/zorm-mcp/start.sh",
+    "args": ["--config", "D:/codes/zorm-mcp/zorm-mcp.json"]
 } } }
 ```
 
@@ -98,7 +99,7 @@ claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh --config D:/codes/mcp/
 `claude_desktop_config.json`（设置 → Developer → Edit Config）：
 
 ```json
-{ "mcpServers": { "zorm-mcp": { "command": "D:/codes/mcp/zorm-mcp/start.sh" } } }
+{ "mcpServers": { "zorm-mcp": { "command": "D:/codes/zorm-mcp/start.sh" } } }
 ```
 
 ## 3. DeepSeek Harness（dsh，已验证 ✅ 严格客户端）
@@ -115,8 +116,8 @@ DSH 使用 MCP SDK 2.0（协议 2026-07-28），对 `tools/list` 等结果的 `t
       config:
         serverName: zorm-mcp
         transport: stdio
-        command: D:/codes/mcp/zorm-mcp/start.sh
-        cwd: D:/codes/mcp/zorm-mcp
+        command: D:/codes/zorm-mcp/start.sh
+        cwd: D:/codes/zorm-mcp
 ```
 
 保存即热加载（`patchReload: "live"`）。日志出现 `mcp-client(zorm-mcp)` 即注册成功；见 `server is disconnected` 先确认 exe 是最新构建。工具名形如 `mcp__zorm-mcp__db_query`。
@@ -128,7 +129,7 @@ VS Code 1.99+ 原生 MCP，Copilot Chat 的 agent 模式直接消费同一配置
 **项目级** `.vscode/mcp.json`（推荐，可签入）：
 
 ```json
-{ "servers": { "zorm-mcp": { "command": "D:/codes/mcp/zorm-mcp/start.sh" } } }
+{ "servers": { "zorm-mcp": { "command": "D:/codes/zorm-mcp/start.sh" } } }
 ```
 
 **用户级**：`settings.json` 里同结构的 `"mcp": { "servers": { ... } }`。保存后 Copilot/Agent 模式的工具列表出现 `db_*` 即成功。JetBrains 全家桶（IDEA/PyCharm 2025.2+）在 Settings → Tools → MCP 里加 stdio server，command 同上。
@@ -138,7 +139,7 @@ VS Code 1.99+ 原生 MCP，Copilot Chat 的 agent 模式直接消费同一配置
 `~/.cursor/mcp.json`（全局）或项目根 `.cursor/mcp.json`：
 
 ```json
-{ "mcpServers": { "zorm-mcp": { "command": "D:/codes/mcp/zorm-mcp/start.sh" } } }
+{ "mcpServers": { "zorm-mcp": { "command": "D:/codes/zorm-mcp/start.sh" } } }
 ```
 
 保存后 Cursor Settings → MCP 显示绿点即成功。
@@ -148,7 +149,7 @@ VS Code 1.99+ 原生 MCP，Copilot Chat 的 agent 模式直接消费同一配置
 `~/.codeium/windsurf/mcp_config.json`：
 
 ```json
-{ "mcpServers": { "zorm-mcp": { "command": "D:/codes/mcp/zorm-mcp/start.sh" } } }
+{ "mcpServers": { "zorm-mcp": { "command": "D:/codes/zorm-mcp/start.sh" } } }
 ```
 
 ## 7. Cline / Roo Code（VS Code 插件）
@@ -157,7 +158,7 @@ Cline：侧栏 MCP Servers 图标 → Configure → `cline_mcp_settings.json`（
 
 ```json
 { "mcpServers": { "zorm-mcp": {
-    "command": "D:/codes/mcp/zorm-mcp/start.sh",
+    "command": "D:/codes/zorm-mcp/start.sh",
     "args": [],
     "disabled": false,
     "autoApprove": ["db_list_tables", "db_describe_table", "db_indexes", "db_info",
@@ -173,7 +174,7 @@ Cline：侧栏 MCP Servers 图标 → Configure → `cline_mcp_settings.json`（
 
 ```toml
 [mcp_servers.zorm-mcp]
-command = "D:/codes/mcp/zorm-mcp/start.sh"
+command = "D:/codes/zorm-mcp/start.sh"
 args = []
 ```
 
@@ -184,16 +185,16 @@ Codex 会话内工具以 `zorm-mcp.db_query` 形态暴露。
 `~/.gemini/settings.json`：
 
 ```json
-{ "mcpServers": { "zorm-mcp": { "command": "D:/codes/mcp/zorm-mcp/start.sh", "args": [] } } }
+{ "mcpServers": { "zorm-mcp": { "command": "D:/codes/zorm-mcp/start.sh", "args": [] } } }
 ```
 
 ## 10. MCP Inspector（协议调试，已验证 ✅）
 
 ```bash
 # stdio 模式
-npx @modelcontextprotocol/inspector D:/codes/mcp/zorm-mcp/bin/zorm_mcp_server.exe
+npx @modelcontextprotocol/inspector D:/codes/zorm-mcp/bin/zorm_mcp_server.exe
 # HTTP 模式（transport 选 Streamable HTTP，URL 填 http://127.0.0.1:18099/mcp）
-D:/codes/mcp/zorm-mcp/bin/zorm_mcp_server.exe --http 18099 --yes &
+D:/codes/zorm-mcp/bin/zorm_mcp_server.exe --http 18099 --yes &
 npx @modelcontextprotocol/inspector --transport http http://127.0.0.1:18099/mcp
 ```
 
@@ -204,8 +205,16 @@ UI 里可逐个调工具、看 resources / prompts（`db-playbook`）/ MRTR 确�
 `--http <port>` 起纯 Streamable HTTP 服务（不跑 stdio），端点 `http://127.0.0.1:<port>/mcp`，多 worker / 浏览器 Inspector / 远程客户端均可接：
 
 ```bash
-D:/codes/mcp/zorm-mcp/bin/zorm_mcp_server.exe --http 18099
+# 匿名（仅限本机/内网调试）
+D:/codes/zorm-mcp/bin/zorm_mcp_server.exe --http 18099
+
+# 静态 Bearer 鉴权（可重复 --http-token 配多个）
+D:/codes/zorm-mcp/bin/zorm_mcp_server.exe --http 18099 --http-token "s3cret"
+# 可选：--http-origin https://app.example.com   （浏览器跨域白名单）
+# 可选：--sse-keepalive 5000                     （订阅流保活毫秒；0 关闭）
 ```
+
+带鉴权时请求需加 `Authorization: Bearer s3cret`；缺失/错误返回 401。token 同时作为 MRTR 状态绑定的 principal，A token stage 的写操作不能由 B token 批准。
 
 裸 curl 冒烟（新协议头镜像校验：`Mcp-Name` 必须等于 body 里的 `name`）：
 
@@ -229,7 +238,7 @@ Open WebUI 等只认 OpenAPI 的平台，可用社区 [mcpo](https://github.com/
 | **Reasonix** | 占位 | 是否支持本地 stdio MCP；配置入口 |
 | **Grok build**（xAI） | 占位 | 官方 agent 的 MCP 支持面；若只有 remote MCP，可用 §11 的 `--http` + 反代暴露 |
 
-> 有确切配置格式后，按 §1–§9 的模板补全本节即可——配置三要素恒为：`command`（start 脚本或 exe 绝对路径）、`args`（启动参数如 `--config`）、`cwd`（可选，建议 `D:/codes/mcp/zorm-mcp`）。
+> 有确切配置格式后，按 §1–§9 的模板补全本节即可——配置三要素恒为：`command`（start 脚本或 exe 绝对路径）、`args`（启动参数如 `--config`）、`cwd`（可选，建议 `D:/codes/zorm-mcp`）。
 
 ---
 
@@ -239,5 +248,6 @@ Open WebUI 等只认 OpenAPI 的平台，可用社区 [mcpo](https://github.com/
 - **AI 乱选工具 / 写错 `db` 参数**：报错自带可用后端清单和替代工具建议（自纠错设计）；服务器 `instructions` 已含完整决策表。仍不理想时，把 `db://guide` 资源或 `db-playbook` prompt 喂给会话。
 - **`db_exec_sql` 看不到**：默认不注册，`--allow-sql` 才暴露——这是刻意设计（结构化写工具已覆盖绝大多数场景）。
 - **客户端日志显示 `Process exited with code 3221225781`（0xC0000135 `STATUS_DLL_NOT_FOUND`）**：exe 同目录缺运行期 DLL——客户端（VS Code、从资源管理器启动的终端等）没有 MSYS2 的 PATH，`libc++.dll`/`libmariadb.dll` 等解析不到。重新构建对应目标，POST_BUILD 会按依赖闭包把 DLL 复制到 exe 目录（正常应看到 `zorm: bundled N resolved runtime DLL(s)`）；不要把 `D:/msys64/clang64/bin` 塞进客户端配置来绕过。
-- **协议兼容性**：stdio 模式兼容 2024-11-05 → 2026-07-28 全系版本（legacy initialize + 新版 server/discover 双握手）；严格客户端（DSH）验证过 CacheableResult 字段。
+- **协议兼容性**：stdio/HTTP 均兼容 2024-11-05 → 2026-07-28 全系版本（legacy initialize + 新版 server/discover 双握手）；严格客户端（DSH）验证过 CacheableResult 字段；modern 结果带 `_meta.serverInfo`，资源能力声明 `subscribe`/`listChanged`。
+- **HTTP 暴露到非本机**：至少加 `--http-token`，并用 `--http-origin` 限制浏览器来源；需要 TLS/多用户时在前面放反向代理。
 - **要长期接生产库**：建议 `--config` 用绝对路径 + 专用的低权限数据库账号（只授业务库权限），不要复用管理员账号。

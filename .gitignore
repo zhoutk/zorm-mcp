@@ -11,3 +11,7 @@ out/
 *.json
 !zorm-mcp.json
 demo/zorm-mcp/
+
+# llvm-cov profiles
+*.profraw
+*.profdata

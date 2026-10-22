@@ -343,13 +343,13 @@ TEST(ZormAnalyticsE2E, MrtrWriteConfirmation) {
   Json data2;
   data2.add("note", Json::str("e2e-mrtr"));
   retryArgs.add("data", std::move(data2));
-  retryArgs.add("requestState", Json::str(state));
   Json responses;
   Json confirm;
   confirm.add("approved", Json(true));
   responses.add("confirm", std::move(confirm));
-  retryArgs.add("inputResponses", std::move(responses));
-  auto second = client.callTool("db_insert", retryArgs);
+  // Spec MRTR: requestState/inputResponses ride at the params level.
+  auto second = client.retryToolCall("db_insert", retryArgs, *first,
+                                     std::move(responses));
   ASSERT_TRUE(second.has_value());
   EXPECT_EQ((*second)["resultType"].toString(), "complete");
   // Persisted - verify via count.
@@ -372,20 +372,18 @@ TEST(ZormAnalyticsE2E, MrtrWriteConfirmation) {
       delArgs.add("where", std::move(where));
       auto delFirst = client.callTool("db_delete", delArgs);
       if (delFirst.has_value() && (*delFirst)["resultType"].toString() == "input_required") {
-        const std::string state = (*delFirst)["requestState"].toString();
         Json delRetry;
         delRetry.add("db", Json::str("jsonfile"));
         delRetry.add("table", Json::str("analytics"));
         Json where2;
         where2.add("id", Json::str(row["id"].toString()));
         delRetry.add("where", std::move(where2));
-        delRetry.add("requestState", Json::str(state));
         Json delResponses;
         Json delConfirm;
         delConfirm.add("approved", Json(true));
         delResponses.add("confirm", std::move(delConfirm));
-        delRetry.add("inputResponses", std::move(delResponses));
-        (void)client.callTool("db_delete", delRetry);
+        (void)client.retryToolCall("db_delete", delRetry, *delFirst,
+                                   std::move(delResponses));
       }
     }
   }

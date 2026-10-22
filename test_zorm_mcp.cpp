@@ -14,12 +14,20 @@
 // start and end of each run so the suite is idempotent.
 
 #include <mcp/mcp.hpp>
+#if defined(MCP_HAS_HTTP)
+#include <mcp/transport_http.hpp>
+#endif
 
 #include <gtest/gtest.h>
 
+#include <chrono>
 #include <cstdio>
+#include <filesystem>
+#include <fstream>
 #include <optional>
+#include <random>
 #include <string>
+#include <thread>
 #include <vector>
 
 using namespace mcp;
@@ -71,9 +79,28 @@ struct Child {
       inWrite = nullptr;
     }
   }
+  void terminate() {
+    if (pi.hProcess) {
+      TerminateProcess(pi.hProcess, 0);
+      WaitForSingleObject(pi.hProcess, 2000);
+      CloseHandle(pi.hProcess);
+      pi.hProcess = nullptr;
+      CloseHandle(pi.hThread);
+      pi.hThread = nullptr;
+    }
+  }
+  int waitExit() {
+    DWORD code = 0;
+    if (pi.hProcess) {
+      WaitForSingleObject(pi.hProcess, 10000);
+      GetExitCodeProcess(pi.hProcess, &code);
+    }
+    return static_cast<int>(code);
+  }
 };
 
-Child spawnChild(bool confirmWrites, bool allowSql) {
+Child spawnChild(bool confirmWrites, bool allowSql,
+                 const std::vector<std::string>& extraArgs = {}) {
 #ifdef ZORM_DLL_DIR
   // The server child loads zorm's runtime DLLs; make sure they resolve even
   // when ctest runs outside the run-test PATH setup.
@@ -94,6 +121,7 @@ Child spawnChild(bool confirmWrites, bool allowSql) {
   std::string cmdline = std::string("\"") + serverPath + "\" --child";
   if (!confirmWrites) cmdline += " --yes";
   if (allowSql) cmdline += " --allow-sql";
+  for (const auto& arg : extraArgs) cmdline += " " + arg;
   SECURITY_ATTRIBUTES sa{sizeof(SECURITY_ATTRIBUTES), nullptr, TRUE};
   HANDLE inRead = nullptr, outWrite = nullptr;
   Child c;
@@ -116,6 +144,7 @@ Child spawnChild(bool confirmWrites, bool allowSql) {
 
 }  // namespace
 #else
+#include <csignal>
 #include <sys/wait.h>
 #include <unistd.h>
 namespace {
@@ -146,8 +175,26 @@ struct Child {
       inWrite = -1;
     }
   }
+  void terminate() {
+    if (pid > 0) {
+      kill(pid, SIGKILL);
+      waitpid(pid, nullptr, 0);
+      pid = -1;
+    }
+  }
+  int waitExit() {
+    int status = 0;
+    if (pid > 0) {
+      waitpid(pid, &status, 0);
+      pid = -1;
+      if (WIFEXITED(status)) return WEXITSTATUS(status);
+      return -1;
+    }
+    return 0;
+  }
 };
-Child spawnChild(bool confirmWrites, bool allowSql) {
+Child spawnChild(bool confirmWrites, bool allowSql,
+                 const std::vector<std::string>& extraArgs = {}) {
   // Spawn the real server executable sitting next to this test (never
   // self-spawn: this test's main is gtest_main without --child).
   std::string self = "/proc/self/exe";
@@ -166,7 +213,7 @@ Child spawnChild(bool confirmWrites, bool allowSql) {
     dup2(outPipe[1], STDOUT_FILENO);
     close(inPipe[0]); close(inPipe[1]); close(outPipe[0]); close(outPipe[1]);
     std::vector<char*> childArgv = {const_cast<char*>("zorm_mcp_server"),
-                                    const_cast<char*>("--child"), nullptr};
+                                    const_cast<char*>("--child")};
     std::string yesFlag, sqlFlag;
     if (!confirmWrites) {
       yesFlag = "--yes";
@@ -176,6 +223,9 @@ Child spawnChild(bool confirmWrites, bool allowSql) {
       sqlFlag = "--allow-sql";
       childArgv.push_back(const_cast<char*>(sqlFlag.c_str()));
     }
+    for (const auto& arg : extraArgs)
+      childArgv.push_back(const_cast<char*>(arg.c_str()));
+    childArgv.push_back(nullptr);
     execv(serverPath.c_str(), childArgv.data());
     _exit(127);
   }
@@ -236,10 +286,10 @@ McpResult<Json> execSql(Client& client, const std::string& sql) {
 McpResult<Json> callWrite(Client& client, const char* tool, Json args) {
   auto rs = client.callTool(tool, args);
   if (rs.has_value() && (*rs)["resultType"].toString() == "input_required") {
-    Json retry = args;
-    retry.add("requestState", (*rs)["requestState"]);
-    retry.add("inputResponses", Json(R"({"confirm":{"approved":true}})"));
-    rs = client.callTool(tool, retry);
+    // Per MCP MRTR the retry carries requestState/inputResponses at the
+    // tools/call params level, not inside `arguments`.
+    rs = client.retryToolCall(tool, args, *rs,
+                              Json(R"({"confirm":{"approved":true}})"));
   }
   return rs;
 }
@@ -568,6 +618,69 @@ TEST(ZormMcpE2E, DataPlaneEndToEnd) {
   EXPECT_NE((*comp).toString().find("t_e2e"), std::string::npos);
 }
 
+// ---- validation and failure paths -----------------------------------------------
+
+TEST(ZormMcpE2E, ValidationAndWriteFailurePaths) {
+  Child child = spawnChild(false, true);  // --yes --allow-sql
+  PipeTransport t(child);
+  Client client("e2e", "1.0");
+  client.connect(t);
+  ASSERT_NO_FATAL_FAILURE(resetTable(client));
+
+  // Data-plane tools validate `db` like the metadata tools do.
+  auto noDb = client.callTool("db_query",
+                              Json(R"({"db":"oracle","table":"t_e2e"})"));
+  ASSERT_FALSE(noDb.has_value());
+  EXPECT_EQ(noDb.error().code, McpErrorCode::InvalidParams);
+  EXPECT_NE(noDb.error().message.find("sqlite3"), std::string::npos);
+  // The tool inputSchema is enforced before the handler: required fields and
+  // minItems reject malformed calls as InvalidParams.
+  auto noTable = client.callTool("db_query", Json(R"({"db":"sqlite3"})"));
+  ASSERT_FALSE(noTable.has_value());
+  EXPECT_EQ(noTable.error().code, McpErrorCode::InvalidParams);
+  EXPECT_NE(noTable.error().message.find("table"), std::string::npos);
+  auto emptyBatch = client.callTool(
+      "db_insert_batch", Json(R"({"db":"sqlite3","table":"t_e2e","rows":[]})"));
+  ASSERT_FALSE(emptyBatch.has_value());
+  EXPECT_EQ(emptyBatch.error().code, McpErrorCode::InvalidParams);
+  auto emptyTrans = client.callTool(
+      "db_trans", Json(R"({"db":"sqlite3","sqls":[]})"));
+  ASSERT_FALSE(emptyTrans.has_value());
+  EXPECT_EQ(emptyTrans.error().code, McpErrorCode::InvalidParams);
+  auto badTable = client.callTool(
+      "db_delete",
+      Json(R"({"db":"sqlite3","table":"bad name","where":{}})"));
+  ASSERT_FALSE(badTable.has_value());
+  EXPECT_NE(badTable.error().message.find("invalid table name"), std::string::npos);
+
+  // Metadata identifier validation + the jsonfile "no indexes" branch.
+  auto badDescribe = client.callTool(
+      "db_describe_table", Json(R"({"db":"sqlite3","table":"bad-name"})"));
+  ASSERT_FALSE(badDescribe.has_value());
+  EXPECT_NE(badDescribe.error().message.find("invalid table name"), std::string::npos);
+  auto badIndexes = client.callTool(
+      "db_indexes", Json(R"({"db":"sqlite3","table":"bad-name"})"));
+  ASSERT_FALSE(badIndexes.has_value());
+  EXPECT_NE(badIndexes.error().message.find("invalid table name"), std::string::npos);
+  auto jsonIndexes = client.callTool(
+      "db_indexes", Json(R"({"db":"jsonfile","table":"t_e2e_json"})"));
+  ASSERT_TRUE(jsonIndexes.has_value()) << jsonIndexes.error().message;
+  EXPECT_NE(jsonIndexes->toString().find("no index concept"), std::string::npos);
+  auto jsonInfo = client.callTool("db_info", Json(R"({"db":"jsonfile"})"));
+  ASSERT_TRUE(jsonInfo.has_value()) << jsonInfo.error().message;
+  EXPECT_EQ((*jsonInfo)["type"].toString(), "jsonfile");
+  EXPECT_TRUE((*jsonInfo)["ready"].isTrue());
+
+  // A driver-level write failure names the file and carries the raw message.
+  auto failed = client.callTool(
+      "db_insert",
+      Json(R"({"db":"sqlite3","table":"no_such_table","data":{"id":"x"}})"));
+  ASSERT_FALSE(failed.has_value());
+  EXPECT_EQ(failed.error().code, McpErrorCode::InternalError);
+  EXPECT_NE(failed.error().message.find("write failed"), std::string::npos);
+  EXPECT_NE(failed.error().message.find("[file:"), std::string::npos);
+}
+
 // ---- the open-box jsonfile backend (same semantics, no SQL) ----------------------
 
 TEST(ZormMcpE2E, JsonfileParity) {
@@ -637,13 +750,13 @@ TEST(ZormMcpE2E, MrtrWriteConfirmation) {
   EXPECT_NE(msg.find("jsonfile." + std::string(tb)), std::string::npos);
   EXPECT_NE(msg.find(state), std::string::npos);
 
-  // Approved retry: original args + requestState + inputResponses -> execute.
+  // Approved retry: spec-level retry (requestState + inputResponses at the
+  // params root) -> execute.
   Json retry = argsWith("jsonfile");
   retry.add("table", Json::str(tb));
   retry.add("data", Json(R"({"note":"e2e-zorm-mcp"})"));
-  retry.add("requestState", Json::str(state));
-  retry.add("inputResponses", Json(R"({"confirm":{"approved":true}})"));
-  auto second = client.callTool("db_insert", retry);
+  auto second = client.retryToolCall("db_insert", retry, *first,
+                                     Json(R"({"confirm":{"approved":true}})"));
   ASSERT_TRUE(second.has_value());
   expectEnvelope(*second);
   EXPECT_EQ((*second)["status"].toInt(), 200);
@@ -659,26 +772,61 @@ TEST(ZormMcpE2E, MrtrWriteConfirmation) {
   Json decline = argsWith("jsonfile");
   decline.add("table", Json::str(tb));
   decline.add("data", Json(R"({"note":"e2e-rejected"})"));
-  decline.add("requestState", Json::str((*req2)["requestState"].toString()));
-  decline.add("inputResponses", Json(R"({"confirm":{"approved":false}})"));
-  auto declined = client.callTool("db_insert", decline);
+  auto declined = client.retryToolCall("db_insert", decline, *req2,
+                                       Json(R"({"confirm":{"approved":false}})"));
   ASSERT_TRUE(declined.has_value());
   EXPECT_EQ((*declined)["resultType"].toString(), "complete");
   EXPECT_NE((*declined).toString().find("cancelled"), std::string::npos);
   ASSERT_EQ(countOf(client, "jsonfile", tb), 1);
 
-  // Unknown requestState -> InvalidParams with re-stage guidance.
+  // Unknown/forged requestState -> InvalidParams with re-stage guidance.
   Json stale = argsWith("jsonfile");
   stale.add("table", Json::str(tb));
   stale.add("data", Json(R"({"note":"x"})"));
-  stale.add("requestState", Json::str("st-999999"));
-  stale.add("inputResponses", Json(R"({"confirm":{"approved":true}})"));
-  auto errRs = client.callTool("db_insert", stale);
+  Json forged = Json(R"({"requestState":"st-999999"})");
+  auto errRs = client.retryToolCall("db_insert", stale, forged,
+                                    Json(R"({"confirm":{"approved":true}})"));
   ASSERT_FALSE(errRs.has_value());
   EXPECT_EQ(errRs.error().code, McpErrorCode::InvalidParams);
   EXPECT_NE(errRs.error().message.find("stage a new one"), std::string::npos);
 
-  // Flat-form approval ({"approved":true} at top level) also executes.
+  // A tampered (single-character) state is rejected by the codec.
+  Json stageT = argsWith("jsonfile");
+  stageT.add("table", Json::str(tb));
+  stageT.add("data", Json(R"({"note":"tamper"})"));
+  auto reqT = client.callTool("db_insert", stageT);
+  ASSERT_TRUE(reqT.has_value());
+  std::string tampered = (*reqT)["requestState"].toString();
+  ASSERT_GT(tampered.size(), 12u);
+  tampered[tampered.size() / 2] =
+      tampered[tampered.size() / 2] == 'A' ? 'B' : 'A';
+  Json tamperedPrev = Json(R"({})");
+  tamperedPrev.add("requestState", Json::str(tampered));
+  auto tamperedRs = client.retryToolCall("db_insert", stageT, tamperedPrev,
+                                         Json(R"({"confirm":{"approved":true}})"));
+  ASSERT_FALSE(tamperedRs.has_value());
+  EXPECT_EQ(tamperedRs.error().code, McpErrorCode::InvalidParams);
+  EXPECT_NE(tamperedRs.error().message.find("invalid, expired, forged"),
+            std::string::npos);
+  EXPECT_EQ(countOf(client, "jsonfile", tb), 1);
+
+  // A state issued for one tool cannot be replayed against another.
+  Json stageX = argsWith("jsonfile");
+  stageX.add("table", Json::str(tb));
+  stageX.add("data", Json(R"({"note":"cross-tool"})"));
+  auto reqX = client.callTool("db_insert", stageX);
+  ASSERT_TRUE(reqX.has_value());
+  Json crossArgs = argsWith("jsonfile");
+  crossArgs.add("table", Json::str(tb));
+  crossArgs.add("data", Json(R"({"note":"cross-tool"})"));
+  crossArgs.add("where", Json(R"({"id":"nope"})"));
+  auto crossRs = client.retryToolCall("db_update", crossArgs, *reqX,
+                                      Json(R"({"confirm":{"approved":true}})"));
+  ASSERT_FALSE(crossRs.has_value());
+  EXPECT_EQ(crossRs.error().code, McpErrorCode::InvalidParams);
+  EXPECT_EQ(countOf(client, "jsonfile", tb), 1);
+
+  // Flat-form approval ({"approved":true}) also executes.
   Json stage3 = argsWith("jsonfile");
   stage3.add("table", Json::str(tb));
   stage3.add("data", Json(R"({"note":"e2e-flat"})"));
@@ -687,15 +835,403 @@ TEST(ZormMcpE2E, MrtrWriteConfirmation) {
   Json flat = argsWith("jsonfile");
   flat.add("table", Json::str(tb));
   flat.add("data", Json(R"({"note":"e2e-flat"})"));
-  flat.add("requestState", Json::str((*req3)["requestState"].toString()));
-  flat.add("inputResponses", Json(R"({"approved":true})"));
-  auto flatRs = client.callTool("db_insert", flat);
+  auto flatRs = client.retryToolCall("db_insert", flat, *req3,
+                                     Json(R"({"approved":true})"));
   ASSERT_TRUE(flatRs.has_value());
   EXPECT_EQ((*flatRs)["status"].toInt(), 200);
+
+  // An unrecognized inputResponses shape counts as NOT approved (fail-safe).
+  Json stage4 = argsWith("jsonfile");
+  stage4.add("table", Json::str(tb));
+  stage4.add("data", Json(R"({"note":"e2e-garbage"})"));
+  auto req4 = client.callTool("db_insert", stage4);
+  ASSERT_TRUE(req4.has_value());
+  auto garbage = client.retryToolCall("db_insert", stage4, *req4,
+                                      Json(R"({"nonsense":"yes"})"));
+  ASSERT_TRUE(garbage.has_value());
+  EXPECT_NE((*garbage).toString().find("cancelled"), std::string::npos);
+
+  // Placement guard: the old in-arguments form is rejected with guidance.
+  Json misplaced = argsWith("jsonfile");
+  misplaced.add("table", Json::str(tb));
+  misplaced.add("data", Json(R"({"note":"misplaced"})"));
+  misplaced.add("requestState", Json::str((*req4)["requestState"].toString()));
+  // callTool puts requestState INSIDE arguments here - exactly what the
+  // server must reject rather than silently re-stage.
+  auto misplacedRs = client.callTool("db_insert", misplaced);
+  ASSERT_FALSE(misplacedRs.has_value());
+  EXPECT_NE(misplacedRs.error().message.find("params level"), std::string::npos);
+
+  // One-shot semantics: an already-consumed state cannot execute again.
+  Json stage5 = argsWith("jsonfile");
+  stage5.add("table", Json::str(tb));
+  stage5.add("data", Json(R"({"note":"once"})"));
+  auto req5 = client.callTool("db_insert", stage5);
+  ASSERT_TRUE(req5.has_value());
+  auto once = client.retryToolCall("db_insert", stage5, *req5,
+                                   Json(R"({"confirm":{"approved":true}})"));
+  ASSERT_TRUE(once.has_value());
+  auto replayed = client.retryToolCall("db_insert", stage5, *req5,
+                                       Json(R"({"confirm":{"approved":true}})"));
+  ASSERT_FALSE(replayed.has_value());
+  EXPECT_NE(replayed.error().message.find("no pending"), std::string::npos);
+
+  // Id-targeted delete stages with an impact estimate (count-first wording).
+  Json del = argsWith("jsonfile");
+  del.add("table", Json::str(tb));
+  del.add("where", Json(R"({"id":"no-such-id"})"));
+  auto delReq = client.callTool("db_delete", del);
+  ASSERT_TRUE(delReq.has_value());
+  ASSERT_EQ((*delReq)["resultType"].toString(), "input_required");
+  EXPECT_NE((*delReq)["content"][0]["text"].toString().find("0 rows"),
+            std::string::npos);
+  auto delDone = client.retryToolCall("db_delete", del, *delReq,
+                                      Json(R"({"confirm":{"approved":true}})"));
+  ASSERT_TRUE(delDone.has_value()) << delDone.error().message;
 
   ASSERT_NO_FATAL_FAILURE(clearJsonTable(client, tb));
   EXPECT_EQ(countOf(client, "jsonfile", tb), 0);
 }
+
+// ---- protocol eras, capabilities, negotiation hints -------------------------------
+
+TEST(ZormMcpE2E, ModernDiscoverAdvertisesV04Surface) {
+  Child child = spawnChild(false, false, {"--log-level", "info"});
+  PipeTransport t(child);
+  Client client("e2e", "1.0");
+  client.connect(t);
+
+  auto disc = client.discover();
+  ASSERT_TRUE(disc.has_value()) << disc.error().message;
+  const Json versions = member(*disc, "supportedVersions");
+  ASSERT_TRUE(versions.isArray());
+  const std::string versionText = versions.toString();
+  EXPECT_NE(versionText.find("2026-07-28"), std::string::npos);
+  EXPECT_NE(versionText.find("2025-11-25"), std::string::npos);
+
+  const Json caps = member(*disc, "capabilities");
+  ASSERT_TRUE(caps.isObject());
+  EXPECT_TRUE(member(caps, "tools").isObject());
+  EXPECT_TRUE(member(caps, "prompts").isObject());
+  EXPECT_TRUE(member(caps, "resources").isObject());
+  // mcp-cpp 0.4 declarations: writes publish resource updates, and resources
+  // are list-changeable at runtime (tables can be created/dropped).
+  const Json resources = member(caps, "resources");
+  EXPECT_TRUE(member(resources, "subscribe").isTrue()) << caps.toString();
+  EXPECT_TRUE(member(resources, "listChanged").isTrue()) << caps.toString();
+
+  // CacheableResult hints are mandatory on modern */list results.
+  auto tools = client.listTools();
+  ASSERT_TRUE(tools.has_value()) << tools.error().message;
+  EXPECT_TRUE((*tools)["ttlMs"].isNumber()) << tools->toString();
+  EXPECT_EQ((*tools)["cacheScope"].toString(), "public");
+  // Every modern result carries serverInfo in _meta (D8).
+  EXPECT_EQ((*tools)["_meta"]["io.modelcontextprotocol/serverInfo"]["name"].toString(),
+            "zorm-mcp");
+
+  auto guide = client.readResource("db://guide");
+  ASSERT_TRUE(guide.has_value()) << guide.error().message;
+  EXPECT_TRUE((*guide)["ttlMs"].isNumber());
+  EXPECT_EQ((*guide)["cacheScope"].toString(), "public");
+
+  // Era auto-negotiation (E2) picks the newest mutually supported revision.
+  auto era = client.negotiateEra();
+  ASSERT_TRUE(era.has_value()) << era.error().message;
+  EXPECT_TRUE(era->modern);
+  EXPECT_EQ(era->protocolVersion, "2026-07-28");
+}
+
+TEST(ZormMcpE2E, LegacyClientsWithoutMetaAreServed) {
+  // Raw wire: the 2026-07-28 gates require params._meta, but this server opts
+  // into dual-era mode so pre-2026 clients (Claude Code / VS Code on older
+  // revisions) can call without it.
+  Child child = spawnChild(false, false);
+  PipeTransport t(child);
+
+  ASSERT_TRUE(t.write(R"({"jsonrpc":"2.0","id":1,"method":"tools/list"})")
+                  .has_value());
+  std::string line;
+  ASSERT_TRUE(child.readLine(line)) << "no response to legacy tools/list";
+  std::string err;
+  const Json list = Json::ParseJson(line, err);
+  ASSERT_FALSE(list.isError()) << line;
+  EXPECT_TRUE(member(list, "result").isObject()) << line;
+  EXPECT_EQ(member(list, "result")["tools"].size() > 0, true);
+
+  ASSERT_TRUE(
+      t.write(R"({"jsonrpc":"2.0","id":2,"method":"tools/call",)"
+              R"("params":{"name":"db_list_tables","arguments":{"db":"sqlite3"}}})")
+          .has_value());
+  ASSERT_TRUE(child.readLine(line));
+  const Json call = Json::ParseJson(line, err);
+  ASSERT_FALSE(call.isError()) << line;
+  // db_list_tables answers {tables, count} directly (no zorm status field).
+  EXPECT_TRUE(member(call, "result")["tables"].isArray()) << line;
+}
+
+TEST(ZormMcpE2E, ResourceSubscriptionReceivesWriteNotifications) {
+  Child child = spawnChild(false, true);  // --yes --allow-sql
+  PipeTransport t(child);
+  Client client("e2e", "1.0");
+  client.connect(t);
+  ASSERT_NO_FATAL_FAILURE(resetTable(client));
+
+  std::vector<std::string> methods;
+  std::vector<std::string> payloads;
+  client.onNotification([&](const JsonRpcNotification& n) {
+    methods.push_back(n.method);
+    payloads.push_back(n.params.toString());
+  });
+  auto ack = client.subscribe(Json(
+      R"({"notifications":{"resourcesListChanged":true,"resourceSubscriptions":["db://schema/sqlite3/t_e2e"]}})"));
+
+  ASSERT_TRUE(ack.has_value()) << ack.error().message;
+
+  // The write publishes resources/updated + resources/list_changed. They are
+  // handed to onNotification while the NEXT exchange waits for its response.
+  Json ins = argsWith("sqlite3");
+  ins.add("table", Json::str("t_e2e"));
+  ins.add("data", Json(R"({"id":"r-sub","name":"sub","score":1})"));
+  auto rs = client.callTool("db_insert", ins);
+  ASSERT_TRUE(rs.has_value()) << rs.error().message;
+  (void)client.callTool("db_count", Json(R"({"db":"sqlite3","table":"t_e2e"})"));
+
+  bool sawUpdated = false;
+  bool sawListChanged = false;
+  for (size_t i = 0; i < methods.size(); ++i) {
+    if (methods[i] == "notifications/resources/updated") {
+      sawUpdated = payloads[i].find("db://schema/sqlite3/t_e2e") != std::string::npos;
+    }
+    if (methods[i] == "notifications/resources/list_changed") sawListChanged = true;
+  }
+  EXPECT_TRUE(sawUpdated) << methods.size() << " notifications observed";
+  EXPECT_TRUE(sawListChanged);
+  client.closeSubscriptions();
+}
+
+// ---- SQL gate, resources, and configuration edge cases -----------------------------
+
+TEST(ZormMcpE2E, SqlGateAndResourceEdgeCases) {
+  Child child = spawnChild(false, true);  // --yes --allow-sql
+  PipeTransport t(child);
+  Client client("e2e", "1.0");
+  client.connect(t);
+  ASSERT_NO_FATAL_FAILURE(resetTable(client));
+
+  // Every allowlisted read-only first keyword is accepted.
+  for (const char* sql : {"pragma table_info(t_e2e)",
+                          "with x as (select 1 as n) select * from x",
+                          "explain select * from t_e2e"}) {
+    auto rs = client.callTool("db_query_sql",
+                              Json(std::string(R"({"db":"sqlite3","sql":")") + sql +
+                                   R"("})"));
+    EXPECT_TRUE(rs.has_value()) << sql << ": " << rs.error().message;
+  }
+  // A keyword that is only a PREFIX of an identifier is not allowed.
+  auto prefix = client.callTool(
+      "db_query_sql", Json(R"({"db":"sqlite3","sql":"selectivity from t_e2e"})"));
+  ASSERT_FALSE(prefix.has_value());
+  EXPECT_NE(prefix.error().message.find("READ-ONLY"), std::string::npos);
+
+  // Empty SQL and a bad table name both teach the next move.
+  auto empty = client.callTool("db_query_sql", Json(R"({"db":"sqlite3","sql":""})"));
+  ASSERT_FALSE(empty.has_value());
+  EXPECT_NE(empty.error().message.find("sql is required"), std::string::npos);
+  auto bad = client.callTool(
+      "db_query_sql", Json(R"({"db":"sqlite3","sql":"select * from no_such_table"})"));
+  ASSERT_FALSE(bad.has_value());
+  EXPECT_EQ(bad.error().code, McpErrorCode::InvalidParams);
+
+  // db_query variants not exercised by the main data-plane test.
+  auto ors = client.callTool(
+      "db_query",
+      Json(R"({"db":"sqlite3","table":"t_e2e","ors":{"id":"r1","name":"nobody"}})"));
+  EXPECT_TRUE(ors.has_value()) << ors.error().message;
+  Json fuzzy = argsWith("sqlite3");
+  fuzzy.add("table", Json::str("t_e2e"));
+  fuzzy.add("fuzzy", Json(1));
+  fuzzy.add("sort", Json::str("score desc"));
+  fuzzy.add("count", Json::str("id"));
+  auto fz = client.callTool("db_query", fuzzy);
+  EXPECT_TRUE(fz.has_value()) << fz.error().message;
+
+  // Resource error branches.
+  auto unknownPrefix = client.readResource("db://nope");
+  ASSERT_FALSE(unknownPrefix.has_value());
+  EXPECT_NE(unknownPrefix.error().message.find("resource"), std::string::npos);
+  auto unknownDb = client.readResource("db://schema/oracle");
+  ASSERT_FALSE(unknownDb.has_value());
+  EXPECT_NE(unknownDb.error().message.find("available"), std::string::npos);
+  auto unknownTable = client.readResource("db://schema/sqlite3/no_such");
+  ASSERT_FALSE(unknownTable.has_value());
+  EXPECT_NE(unknownTable.error().message.find("unknown table"), std::string::npos);
+  auto dbOnly = client.readResource("db://schema/sqlite3");
+  ASSERT_TRUE(dbOnly.has_value()) << dbOnly.error().message;
+  EXPECT_NE((*dbOnly).toString().find("t_e2e"), std::string::npos);
+
+  // Completion for db (prefix) and fields (column names).
+  // The handler routes on ref.name (the completion argument name).
+  auto dbComp = client.complete(
+      Json(R"({"type":"ref/prompt","name":"db","arguments":{}})"),
+      Json(R"({"name":"db","value":"sql"})"));
+  ASSERT_TRUE(dbComp.has_value()) << dbComp.error().message;
+  EXPECT_NE(dbComp->toString().find("sqlite3"), std::string::npos);
+  auto colComp = client.complete(
+      Json(R"({"type":"ref/prompt","name":"fields","arguments":{"db":"sqlite3","table":"t_e2e"}})"),
+      Json(R"({"name":"fields","value":"sc"})"));
+  ASSERT_TRUE(colComp.has_value()) << colComp.error().message;
+  EXPECT_NE(colComp->toString().find("score"), std::string::npos);
+}
+
+TEST(ZormMcpE2E, ConfigFileAndCli) {
+  namespace fs = std::filesystem;
+  const fs::path dir =
+      fs::temp_directory_path() /
+      ("zorm-mcp-cfg-" + std::to_string(static_cast<long long>(
+                             std::chrono::steady_clock::now().time_since_epoch().count())));
+  fs::create_directories(dir);
+  const fs::path cfg = dir / "cfg.json";
+  const fs::path dbFile = dir / "custom.db";
+  {
+    std::ofstream out(cfg, std::ios::binary);
+    out << R"({"databases":{"cfgdb":{"type":"sqlite3","options":{)"
+        << R"("connString":")" << dbFile.generic_string()
+        << R"(","DbLogClose":true,"parameterized":true}}}})";
+  }
+
+  {
+    Child child = spawnChild(false, false, {"--config", cfg.generic_string()});
+    PipeTransport t(child);
+    Client client("e2e", "1.0");
+    client.connect(t);
+    auto tables = client.callTool("db_list_tables", Json(R"({"db":"cfgdb"})"));
+    ASSERT_TRUE(tables.has_value()) << tables.error().message;
+    EXPECT_TRUE(member(*tables, "tables").isArray());
+    auto info = client.callTool("db_info", Json(R"({"db":"cfgdb"})"));
+    ASSERT_TRUE(info.has_value()) << info.error().message;
+    EXPECT_EQ((*info)["type"].toString(), "sqlite3");
+    // A config file REPLACES the built-in defaults.
+    auto missing = client.callTool("db_list_tables", Json(R"({"db":"sqlite3"})"));
+    ASSERT_FALSE(missing.has_value());
+    EXPECT_NE(missing.error().message.find("cfgdb"), std::string::npos);
+  }
+
+  // Malformed config -> exit code 2 (usage/config error), no server loop.
+  const fs::path badCfg = dir / "bad.json";
+  {
+    std::ofstream out(badCfg, std::ios::binary);
+    out << "{not json";
+  }
+  {
+    Child child = spawnChild(false, false, {"--config", badCfg.generic_string()});
+    EXPECT_EQ(child.waitExit(), 2);
+  }
+
+  // --help prints the flag reference and exits 0.
+  {
+    Child child = spawnChild(false, false, {"--help"});
+    std::string line;
+    bool sawUsage = false;
+    bool sawTokenFlag = false;
+    while (child.readLine(line)) {
+      if (line.find("usage:") != std::string::npos) sawUsage = true;
+      if (line.find("--http-token") != std::string::npos) sawTokenFlag = true;
+    }
+    EXPECT_TRUE(sawUsage);
+    EXPECT_TRUE(sawTokenFlag);
+    EXPECT_EQ(child.waitExit(), 0);
+  }
+
+  // Unknown flag -> usage error (exit 2).
+  {
+    Child child = spawnChild(false, false, {"--bogus-flag"});
+    EXPECT_EQ(child.waitExit(), 2);
+  }
+
+#if defined(MCP_HAS_HTTP)
+  // A chattering SSE keep-alive is a validated misconfiguration, not accepted.
+  {
+    Child child = spawnChild(false, false,
+                             {"--http", "0", "--sse-keepalive", "5"});
+    EXPECT_EQ(child.waitExit(), 2);
+  }
+#endif
+
+  fs::remove_all(dir);
+}
+
+// ---- HTTP transport: authentication, principal-bound MRTR --------------------------
+
+#if defined(MCP_HAS_HTTP)
+TEST(ZormMcpE2E, HttpBearerAuthAndPrincipalBoundState) {
+  // Pick a high port. (A collision is possible in principle; the polling
+  // below turns it into a clear failure rather than a hang.)
+  std::mt19937 rng(std::random_device{}());
+  const int port = 20000 + static_cast<int>(rng() % 40000);
+  Child child = spawnChild(true, false,
+                           {"--http", std::to_string(port), "--http-token", "tokA",
+                            "--http-token", "tokB"});
+  bool up = false;
+  {
+    mcp::http::HttpClientTransport probe("127.0.0.1", port);
+    Client probeClient("e2e-probe", "1.0");
+    probeClient.connect(probe);
+    probe.setHeader("Authorization", "Bearer tokA");
+    probeClient.setRequestTimeout(std::chrono::milliseconds(800));
+    for (int i = 0; i < 50 && !up; ++i) {
+      up = probeClient.discover().has_value();
+      if (!up) std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+  }
+  if (!up) child.terminate();
+  ASSERT_TRUE(up) << "server never accepted HTTP on port " << port;
+
+  mcp::http::HttpClientTransport t("127.0.0.1", port);
+  Client client("e2e-http", "1.0");
+  client.connect(t);
+  client.setRequestTimeout(std::chrono::milliseconds(3000));
+
+  // No Authorization header -> 401 (transport error, no JSON-RPC result).
+  auto anonymous = client.discover();
+  EXPECT_FALSE(anonymous.has_value());
+
+  t.setHeader("Authorization", "Bearer tokA");
+  auto disc = client.discover();
+  ASSERT_TRUE(disc.has_value()) << disc.error().message;
+
+  // Stage a write as principal tokA.
+  const char* tb = "e2e_http";
+  Json clear = argsWith("jsonfile");
+  clear.add("table", Json::str(tb));
+  clear.add("where", Json("{}"));
+  auto cleared = callWrite(client, "db_delete", clear);
+  ASSERT_TRUE(cleared.has_value()) << cleared.error().message;
+
+  Json ins = argsWith("jsonfile");
+  ins.add("table", Json::str(tb));
+  ins.add("data", Json(R"({"note":"principal-bound"})"));
+  auto staged = client.callTool("db_insert", ins);
+  ASSERT_TRUE(staged.has_value()) << staged.error().message;
+  ASSERT_EQ((*staged)["resultType"].toString(), "input_required");
+
+  // A DIFFERENT bearer cannot redeem tokA's sealed state (F1 / D7).
+  t.setHeader("Authorization", "Bearer tokB");
+  auto cross = client.retryToolCall("db_insert", ins, *staged,
+                                    Json(R"({"confirm":{"approved":true}})"));
+  ASSERT_FALSE(cross.has_value());
+  EXPECT_EQ(cross.error().code, McpErrorCode::InvalidParams);
+
+  // The original principal still can.
+  t.setHeader("Authorization", "Bearer tokA");
+  auto ok = client.retryToolCall("db_insert", ins, *staged,
+                                 Json(R"({"confirm":{"approved":true}})"));
+  ASSERT_TRUE(ok.has_value()) << ok.error().message;
+  EXPECT_EQ((*ok)["status"].toInt(), 200);
+
+  client.closeSubscriptions();
+  child.terminate();
+}
+#endif  // MCP_HAS_HTTP
 
 // ---- MRTR on the trans tool + graceful shutdown ------------------------------------
 
@@ -722,9 +1258,8 @@ TEST(ZormMcpE2E, MrtrTransAndShutdown) {
   Json retry = argsWith("sqlite3");
   retry.add("sqls",
             Json(R"([{"table":"t_e2e","method":"insert","params":{"id":"r1","name":"ada","score":1}},{"table":"t_e2e","method":"insert","params":{"id":"r2","name":"bob","score":2}}])"));
-  retry.add("requestState", Json::str(state));
-  retry.add("inputResponses", Json(R"({"action":"accept"})"));
-  auto second = client.callTool("db_trans", retry);
+  auto second = client.retryToolCall("db_trans", retry, *first,
+                                     Json(R"({"action":"accept"})"));
   ASSERT_TRUE(second.has_value()) << second.error().message;
   EXPECT_EQ((*second)["status"].toInt(), 200);
   EXPECT_EQ(countOf(client, "sqlite3", "t_e2e"), 2);
@@ -738,9 +1273,8 @@ TEST(ZormMcpE2E, MrtrTransAndShutdown) {
   EXPECT_EQ((*req)["resultType"].toString(), "input_required");
   Json sqlRetry = argsWith("sqlite3");
   sqlRetry.add("sql", Json::str("insert into t_e2e (id, name, score) values ('r3','carol',3)"));
-  sqlRetry.add("requestState", Json::str((*req)["requestState"].toString()));
-  sqlRetry.add("inputResponses", Json(R"({"confirm":{"approved":true}})"));
-  auto exec = client.callTool("db_exec_sql", sqlRetry);
+  auto exec = client.retryToolCall("db_exec_sql", sqlRetry, *req,
+                                   Json(R"({"confirm":{"approved":true}})"));
   ASSERT_TRUE(exec.has_value()) << exec.error().message;
   EXPECT_EQ(countOf(client, "sqlite3", "t_e2e"), 3);
 }

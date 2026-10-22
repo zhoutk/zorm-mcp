@@ -27,7 +27,7 @@ ctest --test-dir build                    # e2e 测试（真实 stdio 子进程�
 | 子模块 | 内容 |
 | --- | --- |
 | `thirds/zorm` | zormlib + 后端 DLL + zjson（zorm 项目） |
-| `thirds/mcp-cpp` | MCP 协议库（mcp-cpp 项目） |
+| `thirds/mcp-cpp` | MCP 协议库 **v0.4.0**（mcp-cpp 项目）：2026-07-28 协议、双时代（legacy/stateless）、MRTR 封装、Tasks 扩展、HTTP 鉴权 seam、多 worker 调度 |
 
 两者都是**独立项目**（各自有远端仓库）：要改 zorm / mcp-cpp，直接进对应子模块目录改并提交推送（那里就是完整仓库），然后回到本项目记录新版本：
 
@@ -48,17 +48,17 @@ cd ../.. && ./sync-thirds.sh      # 拉取最新 master 并提交子模块指针
 
 ```bash
 # Claude Code（最简：内置 sqlite3 + jsonfile，默认库文件落在本目录）
-claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh
+claude mcp add zorm-mcp -- D:/codes/zorm-mcp/start.sh
 
 # 推荐：--config 显式指定数据库（模板见 zorm-mcp.json，connString 写绝对路径）
-claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh --config D:/codes/mcp/zorm-mcp/zorm-mcp.json
+claude mcp add zorm-mcp -- D:/codes/zorm-mcp/start.sh --config D:/codes/zorm-mcp/zorm-mcp.json
 ```
 
 ```jsonc
 // 其他客户端通用形态（各客户端配置文件位置见 INTEGRATION.md）
 { "mcpServers": { "zorm-mcp": {
-    "command": "D:/codes/mcp/zorm-mcp/start.sh",
-    "args": ["--config", "D:/codes/mcp/zorm-mcp/zorm-mcp.json"]
+    "command": "D:/codes/zorm-mcp/start.sh",
+    "args": ["--config", "D:/codes/zorm-mcp/zorm-mcp.json"]
 } } }
 ```
 
@@ -100,7 +100,26 @@ claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh --config D:/codes/mcp/
 
 ## MRTR 写确认
 
-所有写工具首次调用**不执行**：返回 `resultType=input_required` + `requestState`，确认文案含 目标库/表/影响行数。客户端（AI 转述给用户）批准后，带原参数 + `requestState` + `inputResponses:{confirm:{approved:true}}` 重试即执行；`approved:false` 取消。对客户端回传形态做了宽泛容错（详见 demo-design.md §2.5）。
+所有写工具首次调用**不执行**：返回 `resultType=input_required` + `requestState`，确认文案含 目标库/表/影响行数。客户端（AI 转述给用户）批准后，带原参数重试，并在 **tools/call 的 params 层**（与 `arguments` 同级）回传：
+
+```jsonc
+"params": {
+  "name": "db_insert",
+  "arguments": { /* 原参数 */ },
+  "requestState": "v1.…",                       // 原样回传，勿修改
+  "inputResponses": { "confirm": { "approved": true } }  // false = 取消
+}
+```
+
+`requestState` 由 mcp-cpp 0.4 的 `RequestStateCodec` 做 HMAC 封装：绑定到当前工具（HTTP 模式还绑定认证主体），伪造、跨工具重放、过期都会被拒绝——此时重新发起一次写调用即可重新 stage。对客户端回传的确认形态仍做了宽泛容错（`confirm`/`content`/`value`/`params` 嵌套或顶层 `approved`，以及 `action: accept/decline`）。
+
+## 协议与传输（mcp-cpp 0.4）
+
+- **双时代**：同时服务 2026-07-28 stateless 协议（`server/discover`，每请求 `_meta`）与 legacy `initialize`（2024-11-05 … 2025-11-25）。
+- **CacheableResult**：`*/list` 与 `resources/read` 自动注入 `ttlMs`/`cacheScope`（严格客户端如 DSH / MCP SDK 2.0 必需）；每条 modern 结果带 `_meta.serverInfo`。
+- **资源通知**：写操作后发布 `notifications/resources/updated` 与 `notifications/resources/list_changed`，并在 capabilities 中声明 `resources.subscribe` / `listChanged`。
+- **MRTR state**：HMAC 封装 + 工具绑定；HTTP 下额外绑定 Bearer principal（见上节）。
+- **派发模型**：库默认 `MCP_WORKERS=1`（单线程），本 server 的 `App` 状态按此设计为无锁；如改用多 worker，需先让全部 handler 线程安全。
 
 ## 命令行参数
 
@@ -108,6 +127,10 @@ claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh --config D:/codes/mcp/
 | --- | --- |
 | `--config <file>` | 多后端配置（`{"databases": {名字: {type, options}}}`）；缺省内置 sqlite3 + jsonfile |
 | `--http <port>` | Streamable HTTP 模式（`http://127.0.0.1:<port>/mcp`），默认 stdio |
+| `--http-token <bearer>` | HTTP 静态 Bearer 鉴权，可重复（多个 token）。未带 `Authorization: Bearer …` 的请求返回 401；token 同时作为 MRTR 状态绑定的 principal |
+| `--http-origin <origin>` | 只允许该 `Origin`（大小写不敏感；无 Origin 的非浏览器客户端仍放行） |
+| `--sse-keepalive <ms>` | 订阅 SSE 流保活间隔，默认 5000；`0` 关闭；`1–99ms` 与 `> 1h` 会被判为错误配置 |
+| `--log-level <level>` | 服务端日志级别下限（debug…emergency）。2026 客户端还需在 `_meta` 里 opt-in；legacy 客户端用 `logging/setLevel` |
 | `--yes` | 关闭 MRTR 确认（自动化/测试专用） |
 | `--allow-sql` | 暴露 `db_exec_sql`（默认隐藏） |
 | `--child` | 内部参数：e2e 测试孵化用 |
@@ -115,9 +138,27 @@ claude mcp add zorm-mcp -- D:/codes/mcp/zorm-mcp/start.sh --config D:/codes/mcp/
 ## 测试
 
 ```bash
-ctest -R mcp_test_zorm_mcp -V    # e2e：真子进程 stdio，覆盖 元数据/智能查询/只读SQL闸门/批量/事务/MRTR/补全/优雅关停
-./run-test all                   # 核心库回归门（zorm 零改动硬约束）
+ctest --test-dir build --output-on-failure   # 全部 3 个套件
+ctest --test-dir build -R mcp_test_zorm_mcp -V   # e2e：真子进程（stdio + HTTP）
 ```
+
+| 套件 | 覆盖 |
+| --- | --- |
+| `mcp_test_zorm_mcp` | e2e：元数据 / 智能查询 / 只读 SQL 闸门 / 批量 / 事务 / MRTR（含篡改、跨工具、跨 principal、一次性）/ 协议双时代 / 资源订阅 / HTTP Bearer / 配置与 CLI |
+| `mcp_test_zorm_unit` | 纯函数单测：JSON 桥、结果信封、`rowVal`、标识符白名单、guide/playbook 文案 |
+| `mcp_test_zorm_analytics` | demo 展示服务器的完整剧本 |
+
+覆盖率（Clang + llvm-cov，可选构建）：
+
+```bash
+cmake --preset clang-rlz -B build-cov -DZORM_MCP_COVERAGE=ON
+cmake --build build-cov -j 8
+LLVM_PROFILE_FILE="$PWD/build-cov/prof-%p.profraw" ctest --test-dir build-cov
+llvm-profdata merge -sparse build-cov/*.profraw -o build-cov/zorm.profdata
+llvm-cov report bin/zorm_mcp_server.exe -instr-profile=build-cov/zorm.profdata
+```
+
+`./run-test all` 仍是 zorm 核心库的回归门（仅在改动 `thirds/zorm` 时需要）。
 
 ## 常见问题
 

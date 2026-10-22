@@ -169,7 +169,7 @@ UI 里可以逐个调用工具、读 Resources、观察 `input_required` 确认�
 - **严格客户端（DeepSeek Harness / MCP SDK 2.0+）报 `Invalid result for tools/list: ttlMs expected number`**：2026-07-28 规范要求 `*/list` 与 `resources/read` 结果必带 `ttlMs`/`cacheScope`（CacheableResult），mcp-cpp 现已默认注入（`ttlMs 0`/`public`，`listCache(-1)` 显式退出）。旧构建缺这两个字段，宽容客户端（Claude Code）不校验所以无感——重新构建 server 即可。
 - **演示数据想重置**：删除 `demo.db` 与 `demo.json` 后重跑 `--setup`。
 - **接入 mysql/postgres/dm8**：写一个 config JSON（参见 `demo-design.md` §2.6），用 `--config` 启动；这些后端需要对应数据库服务器在运行。
-- **AI 不会写确认弹窗**：Claude Code 等客户端对 elicitation 的支持程度不同；若客户端不支持，AI 会看到 `input_required` 的确认请求并转述给用户，用户回复后 AI 带 `inputResponses` 重试——这正是 MRTR 的设计意图。服务器对客户端回传确认的多种形态做了容错（`confirm`/`content`/`value`/`params` 嵌套或顶层 `approved`，及 `action: accept/decline`），详见 `demo-design.md` §MRTR。
+- **AI 不会写确认弹窗**：Claude Code 等客户端对 elicitation 的支持程度不同；若客户端不支持，AI 会看到 `input_required` 的确认请求并转述给用户，用户回复后 AI 带 `inputResponses` 重试——这正是 MRTR 的设计意图。重试时 `requestState`/`inputResponses` 位于 tools/call 的 **params 层**（与 `arguments` 同级），`requestState` 由 mcp-cpp 0.4 做 HMAC 封装并绑定工具名，伪造/跨工具重放会被拒绝；服务器仍对确认载荷的多种形态做容错（`confirm`/`content`/`value`/`params` 嵌套或顶层 `approved`，及 `action: accept/decline`），详见 `demo-design.md` §MRTR。
 - **`SQLITE_READONLY`，写入失败，但文件可写、磁盘无只读、属性只有 `A`**：这是 Windows 的**完整性级别（Integrity Level）**问题，不是文件只读，也不是服务器 bug。Claude Code 在 Windows 上以**低完整性（Low integrity）**运行 MCP 服务器等原生子进程；低完整性进程**能读**普通（中完整性）文件、**不能写**（无"写升"）。于是查询/读表一切正常，只有写操作报 `SQLITE_READONLY`。**最容易触发的情形**：在 Claude Code 会话里用 `mkdir`/`! mkdir` 在 Windows 下新建一个目录（如 `D:\tmp`）并把 `demo.db` 放进去——新目录默认中完整性，低完整性服务器写不进去。修复：把库文件和所在目录的完整性级别降为 Low（`icacls /setintegritylevel Low`，见下一节「六」），或把库放到能被低完整性进程写入的位置。
 
 ---

@@ -401,36 +401,73 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
   ZORM::Idb* db = g.db(dbName);
   if (db == nullptr) return unknownDb(dbName);
 
-  // MRTR retry detection. Clients are unreliable about echoing the exact
-  // shape we ask for, so a retry is ANY of:
-  //   - inputResponses present (object; shape-tolerant, see confirmApproved)
-  //   - requestState present (echoed token)
-  //   - a bare top-level "approved" argument (clients that reply in place)
-  const Json responses = member(args, "inputResponses");
-  const Json reqStateArg = member(args, "requestState");
-  const Json approvedArg = member(args, "approved");
+  // MRTR retry detection. Per the spec the retry carries `requestState` and
+  // `inputResponses` at the tools/call PARAMS level (siblings of `arguments`),
+  // which is also what mcp-cpp's Ctx::openRequestState reads. Older callers of
+  // this server put them inside `arguments`; that placement is accepted for
+  // inputResponses only (it carries no integrity claim).
+  const Json rootResponses = member(c.params, "inputResponses");
+  const Json rootState = member(c.params, "requestState");
+  const Json rootApproved = member(c.params, "approved");
+  const Json argResponses = member(args, "inputResponses");
+  const Json argState = member(args, "requestState");
+  const Json argApproved = member(args, "approved");
+  const Json responses = rootResponses.isObject() ? rootResponses : argResponses;
+  const Json reqStateArg = rootState.isString() ? rootState : argState;
+  const Json approvedArg =
+      (rootApproved.isTrue() || rootApproved.isFalse()) ? rootApproved : argApproved;
+  if (rootState.isNull() && argState.isString()) {
+    return mcp::Err(McpErrorCode::InvalidParams,
+                    "requestState must be sent at the tools/call params level "
+                    "(sibling of `arguments`), not inside `arguments` - echo the "
+                    "requestState value from the input_required result verbatim");
+  }
   const bool isRetry = responses.isObject() || reqStateArg.isString() ||
                        approvedArg.isTrue() || approvedArg.isFalse();
   if (isRetry) {
     const bool approved =
         responses.isObject() ? confirmApproved(responses) : approvedArg.isTrue();
-    // Locate the pending op: prefer the echoed requestState; when the client
-    // dropped it, fall back to the pending op for THIS (db, table, kind) -
-    // with several staged (the client looping before confirming), the latest
-    // one wins.
+    // Locate the pending op. An echoed requestState is verified by the
+    // mcp-cpp RequestStateCodec: only a token THIS server sealed for THIS
+    // tool (and, over HTTP, THIS principal) opens. A forged, expired, or
+    // cross-tool token is rejected instead of being used as a map key.
     std::string state;
     PendingOp op;
     bool found = false;
+    bool hadState = false;
     if (reqStateArg.isString()) {
-      const std::string s = reqStateArg.toString();
-      const auto it = g.pending.find(s);
-      if (it != g.pending.end()) {
-        state = s;
-        op = it->second;
-        found = true;
+      hadState = true;
+      const auto opened = c.openRequestState();
+      if (!opened.has_value()) {
+        return mcp::Err(McpErrorCode::InvalidParams,
+                        "requestState is invalid, expired, forged, or was issued "
+                        "for a different tool - call again without "
+                        "requestState/inputResponses to stage a new one");
+      }
+      if (opened.value().has_value()) {
+        const std::string s = *opened.value();
+        const auto it = g.pending.find(s);
+        if (it != g.pending.end()) {
+          state = s;
+          op = it->second;
+          found = true;
+        }
+      }
+      if (!found) {
+        // Verified state pointing at an op this process no longer holds
+        // (already consumed, or the server restarted). Never fall through to
+        // the tuple fallback here: that could execute a DIFFERENT staged op.
+        return mcp::Err(McpErrorCode::InvalidParams,
+                        "requestState refers to no pending " + kind + " op for " +
+                            dbName + (table.empty() ? "" : "." + table) +
+                            " (already executed or expired) - call again without "
+                            "requestState/inputResponses to stage a new one");
       }
     }
-    if (!found) {
+    if (!hadState) {
+      // Client dropped the state but still answered: fall back to the pending
+      // op for THIS (db, table, kind). With several staged (the client looping
+      // before confirming), the latest one wins.
       int bestN = -1;
       for (const auto& [s, po] : g.pending) {
         if (po.db != dbName || po.table != table || po.kind != kind) continue;
@@ -447,14 +484,13 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
           found = true;
         }
       }
-    }
-    if (!found) {
-      return mcp::Err(McpErrorCode::InvalidParams,
-                      "no pending " + kind + " op for " + dbName +
-                          (table.empty() ? "" : "." + table) +
-                          " (requestState " + reqStateArg.toString() +
-                          " is unknown or expired) - call again without "
-                          "requestState/inputResponses to stage a new one");
+      if (!found) {
+        return mcp::Err(McpErrorCode::InvalidParams,
+                        "no pending " + kind + " op for " + dbName +
+                            (table.empty() ? "" : "." + table) +
+                            " - call again without requestState/inputResponses "
+                            "to stage a new one");
+      }
     }
     g.pending.erase(state);
     if (!approved) {
@@ -464,6 +500,8 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
       result.add("content", Json(R"([{"type":"text","text":"Write cancelled by user."}])"));
       return mcp::Ok(std::move(result));
     }
+    c.log("info", "zorm-mcp: approved " + op.kind + " on " + op.db +
+                      (op.table.empty() ? "" : "." + op.table));
     return executeWrite(op.db, op.table, op.kind, op.args);
   }
 
@@ -493,15 +531,28 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
         ++it;
     }
     g.pending[state] = PendingOp{dbName, table, kind, args};
+    // Seal the internal op id into the wire token. The client only ever echoes
+    // it; the codec binds it to this tool and (with an HTTP principal) this
+    // caller, so it cannot be forged or replayed against another write tool.
+    const auto sealed = c.sealRequestState(state);
+    if (!sealed.has_value()) {
+      g.pending.erase(state);
+      return mcp::Err(McpErrorCode::InternalError,
+                      "failed to seal requestState: " + sealed.error().message);
+    }
     // requestState rides in the confirmation text so strict text-only
     // clients can echo it back verbatim on the retry.
     const std::string msg = "Confirm " + kind + " on " + dbName +
                             (table.empty() ? "" : "." + table) + " (" + impact +
                             ")? Reply with approved:true to proceed (requestState: " +
-                            state + ").";
-    return mcp::Ok(inputRequiredConfirm(state, msg));
+                            sealed.value() + ").";
+    c.log("info", "zorm-mcp: staged " + kind + " on " + dbName +
+                      (table.empty() ? "" : "." + table));
+    return mcp::Ok(inputRequiredConfirm(sealed.value(), msg));
   }
   // --yes: execute immediately (tests / automation).
+  c.log("info", "zorm-mcp: executing " + kind + " on " + dbName +
+                    (table.empty() ? "" : "." + table) + " (confirmation disabled)");
   return executeWrite(dbName, table, kind, args);
 }
 
@@ -594,13 +645,13 @@ void registerDataTools(mcp::server::Builder& b) {
          toolQuery);
   b.tool(Json(R"({"name":"db_count","description":"Count rows in a table (optionally matching a where object whose keys are column conditions). Cheaper and clearer than db_query when only the number matters.","inputSchema":{"type":"object","required":["db","table"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"where":{"type":"object","description":"column conditions, e.g. {\"status\":\"paid\"}"}}}})"),
          toolCount);
-  b.tool(Json(R"({"name":"db_insert","description":"Insert ONE row (MRTR-confirmed). data is a column->value object; a missing id is auto-generated, an existing id upserts. For many rows use db_insert_batch.","inputSchema":{"type":"object","required":["db","table","data"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"data":{"type":"object","description":"column->value row"},"requestState":{"type":"string"},"inputResponses":{"type":"object"}}}})"),
+  b.tool(Json(R"({"name":"db_insert","description":"Insert ONE row (MRTR-confirmed). data is a column->value object; a missing id is auto-generated, an existing id upserts. For many rows use db_insert_batch.","inputSchema":{"type":"object","required":["db","table","data"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"data":{"type":"object","description":"column->value row"}}}})"),
          toolInsert);
-  b.tool(Json(R"({"name":"db_insert_batch","description":"Insert/upsert MULTIPLE rows in one statement (MRTR-confirmed). rows is a non-empty array of column->value objects; on duplicate constraint values existing rows are updated (upsert). Prefer this over repeated db_insert for bulk loads.","inputSchema":{"type":"object","required":["db","table","rows"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"rows":{"type":"array","items":{"type":"object"},"minItems":1,"description":"row objects; keys of the first row define the column list"},"constraint":{"type":"string","description":"upsert conflict column, default id"},"requestState":{"type":"string"},"inputResponses":{"type":"object"}}}})"),
+  b.tool(Json(R"({"name":"db_insert_batch","description":"Insert/upsert MULTIPLE rows in one statement (MRTR-confirmed). rows is a non-empty array of column->value objects; on duplicate constraint values existing rows are updated (upsert). Prefer this over repeated db_insert for bulk loads.","inputSchema":{"type":"object","required":["db","table","rows"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"rows":{"type":"array","items":{"type":"object"},"minItems":1,"description":"row objects; keys of the first row define the column list"},"constraint":{"type":"string","description":"upsert conflict column, default id"}}}})"),
          toolInsertBatch);
-  b.tool(Json(R"({"name":"db_update","description":"Update ONE row by id (MRTR-confirmed). data holds the columns to change; where MUST be {\"id\": <value>}. For condition-based updates use db_trans with a structured update element.","inputSchema":{"type":"object","required":["db","table","data","where"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"data":{"type":"object","description":"columns to change"},"where":{"type":"object","description":"must carry {\"id\": <value>}"},"requestState":{"type":"string"},"inputResponses":{"type":"object"}}}})"),
+  b.tool(Json(R"({"name":"db_update","description":"Update ONE row by id (MRTR-confirmed). data holds the columns to change; where MUST be {\"id\": <value>}. For condition-based updates use db_trans with a structured update element.","inputSchema":{"type":"object","required":["db","table","data","where"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"data":{"type":"object","description":"columns to change"},"where":{"type":"object","description":"must carry {\"id\": <value>}"}}}})"),
          toolUpdate);
-  b.tool(Json(R"({"name":"db_delete","description":"Delete rows (MRTR-confirmed, destructive). where:{\"id\": v} deletes that row; where:{} deletes ALL rows in the table (the confirmation states the affected count). Other conditions are rejected - query ids with db_query then delete by id, or use db_trans for condition-based deletes.","inputSchema":{"type":"object","required":["db","table","where"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"where":{"type":"object","description":"{\"id\": v} for one row, {} for all"},"requestState":{"type":"string"},"inputResponses":{"type":"object"}}}})"),
+  b.tool(Json(R"({"name":"db_delete","description":"Delete rows (MRTR-confirmed, destructive). where:{\"id\": v} deletes that row; where:{} deletes ALL rows in the table (the confirmation states the affected count). Other conditions are rejected - query ids with db_query then delete by id, or use db_trans for condition-based deletes.","inputSchema":{"type":"object","required":["db","table","where"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"where":{"type":"object","description":"{\"id\": v} for one row, {} for all"}}}})"),
          toolDelete);
 }
 

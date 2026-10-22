@@ -24,7 +24,7 @@
 # ---------------------------------------------------------------------------
 
 cmake_minimum_required(VERSION 3.18)
-project(zorm-mcp VERSION 1.0.0 LANGUAGES CXX)
+project(zorm-mcp VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -62,6 +62,23 @@ set(MCP_BUILD_EXAMPLES OFF)        # mcp-cpp: no examples/benchmarks
 
 add_subdirectory(${MCP_CPP_DIR} mcp-cpp-build)
 add_subdirectory(${ZORM_DIR} zorm-build)
+
+# ---- optional source coverage (llvm-cov) -----------------------------------
+# Only OUR targets (added after this point) are instrumented; third-party
+# libraries above stay clean. Usage:
+#   cmake --preset clang-rlz -B build-cov -DZORM_MCP_COVERAGE=ON
+#   cmake --build build-cov -j 8
+#   LLVM_PROFILE_FILE=$PWD/build-cov/prof-%p.profraw ctest --test-dir build-cov
+#   llvm-profdata merge -sparse build-cov/*.profraw -o build-cov/zorm.profdata
+#   llvm-cov report bin/zorm_mcp_server.exe -instr-profile=build-cov/zorm.profdata
+option(ZORM_MCP_COVERAGE "Instrument this project's sources for llvm-cov" OFF)
+if(ZORM_MCP_COVERAGE)
+  if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
+    message(FATAL_ERROR "ZORM_MCP_COVERAGE requires Clang")
+  endif()
+  add_compile_options(-fprofile-instr-generate -fcoverage-mapping)
+  add_link_options(-fprofile-instr-generate)
+endif()
 
 # ---- runtime DLL bundling (this project's own helper) ----------------------
 # AI clients spawn the server with their own environment (no MSYS2 clang64
@@ -134,6 +151,22 @@ if(TARGET gtest)
   endif()
   add_test(NAME mcp_test_zorm_mcp COMMAND mcp_test_zorm_mcp
       WORKING_DIRECTORY $<TARGET_FILE_DIR:mcp_test_zorm_mcp>)
+
+  # Unit tests for the pure helpers (no child process, no database).
+  add_executable(mcp_test_zorm_unit
+    test_zorm_unit.cpp
+    src/json_util.cpp
+    src/guide.cpp
+    src/app.cpp)
+  target_link_libraries(mcp_test_zorm_unit PRIVATE mcp zormlib gtest gtest_main)
+  target_include_directories(mcp_test_zorm_unit PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/src
+    ${ZORM_PUBLIC_INCLUDES})
+  set_target_properties(mcp_test_zorm_unit PROPERTIES
+    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_SOURCE_DIR}/bin)
+  zorm_mcp_bundle_runtime_deps(mcp_test_zorm_unit)
+  add_test(NAME mcp_test_zorm_unit COMMAND mcp_test_zorm_unit
+      WORKING_DIRECTORY $<TARGET_FILE_DIR:mcp_test_zorm_unit>)
 endif()
 
 # ---- demo (the validation showcase this product was born from) --------------

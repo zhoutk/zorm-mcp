@@ -27,13 +27,19 @@ For zorm internals (backend/dialect architecture, `run-test`, the contract test 
 git submodule update --init --recursive   # first checkout only
 cmake --preset clang-rlz                  # Release (default); clang-dbg for Debug
 cmake --build build -j 8
-ctest --test-dir build                    # both e2e suites
+ctest --test-dir build                    # e2e (stdio+HTTP) + unit + demo suites
 ```
 
 - `build/` holds intermediate artifacts only; executables land in `bin/` (`zorm_mcp_server.exe`,
   the demo servers, test exes) — `RUNTIME_OUTPUT_DIRECTORY` is set in CMakeLists.
 - Single e2e suite: `ctest --test-dir build -R mcp_test_zorm_mcp -V`
+- Unit suite (pure helpers, no child process): `ctest --test-dir build -R mcp_test_zorm_unit -V`
 - Single gtest case: `bin/mcp_test_zorm_mcp.exe --gtest_filter=ZormMcpE2E.MrtrWriteConfirmation`
+- Coverage (Clang, optional):
+  `cmake --preset clang-rlz -B build-cov -DZORM_MCP_COVERAGE=ON`, build, run ctest with
+  `LLVM_PROFILE_FILE=$PWD/build-cov/prof-%p.profraw`, then `llvm-profdata merge` + `llvm-cov report`.
+  Only this project's targets are instrumented. Note: the HTTP child is killed (not drained), so its
+  profile is not flushed - exercise the same code via graceful stdio runs when measuring.
 - The e2e test spawns `zorm_mcp_server.exe --child` as a real child over stdio pipes; it sets the
   child's `PATH` from `ZORM_DLL_DIR` (`thirds/zorm/thirds/bin/win10`) itself because ctest `ENVIRONMENT`
   escaping for `PATH` proved unreliable on Windows.
@@ -67,8 +73,9 @@ protocol-faithful: do not modify it for application needs.
 
 | File | Role |
 | --- | --- |
-| `main.cpp` | Arg parsing, `loadSpecs`/`openBackends`/`discoverAllSchemas`, `buildServer()` (registers every tool/resource/prompt), stdio vs `--http` serving |
+| `main.cpp` | Arg parsing, `loadSpecs`/`openBackends`/`discoverAllSchemas`, `buildServer()` (capability declarations, requestState codec, every tool/resource/prompt), stdio vs `--http` serving incl. bearer/origin/SSE-keepalive setup |
 | `app.hpp/.cpp` | Global `App` state (backend registry + `specs`, schema cache, MRTR pending table, `--yes`/`--allow-sql` flags, `weak_ptr<Server>` for write notifications), startup (`loadSpecs`/`openBackends`/`discoverAllSchemas`) and the dialect-routed catalogs behind `listTables`/`describeTable`. The three `type ==` chains are `sqlListTables` / `sqlPrimaryKeys` / `sqlDescribe`; none of this belongs in a tool handler |
+| `test_zorm_mcp.cpp` / `test_zorm_unit.cpp` | e2e (real stdio child + loopback HTTP) and pure-helper unit coverage, registered as separate CTest suites |
 | `guide.hpp/.cpp` | The AI-comprehension layer: `instructionsText()` decision table, `playbookText()`, `db-playbook` prompt |
 | `json_util.hpp/.cpp` | zjson↔mcp-cpp bridging, `okStatus`, result envelopes, `rowVal`/`rowStr`, `validIdentifier` |
 | `meta_tools.cpp` | `db_list_tables` / `db_describe_table` / `db_indexes` / `db_info` |
@@ -93,21 +100,36 @@ Layout rules (why it is flat, and which files get a header):
 
 Key architectural facts:
 
-- **Single-threaded dispatch.** mcp-cpp runs tools on one thread, so `App` members are plain
-  (no locking). `App::db(name)` returns the backend or `nullptr` — every tool validates `db` first and
-  the error lists the available backend names (self-correcting design).
+- **Single-threaded dispatch.** mcp-cpp defaults to `MCP_WORKERS=1` (one dispatch slot), so `App`
+  members are plain (no locking). If the library is rebuilt with N>1 workers, every handler and `App`
+  member becomes a shared-mutable-state problem — keep the default 1 unless that is addressed.
+  `App::db(name)` returns the backend or `nullptr` — every tool validates `db` first and the error
+  lists the available backend names (self-correcting design).
 - **MRTR is centralized.** All writes funnel through `stageWrite(ctx, kind)` (in `data_tools.cpp`,
-  reused by `sql_tools.cpp`). First call returns `input_required` + `requestState` and stages a
-  `PendingOp`; an approved retry echoes `requestState` + `inputResponses:{confirm:{approved:true}}`
-  and runs `executeWrite`. `--yes` bypasses the gate (tests/automation only); `--allow-sql` is what
-  registers `db_exec_sql`. Client confirmation payloads are shape-tolerant (`confirm`/`content`/
-  `value`/`params`, `action: accept|decline`) — see `confirmApproved` in `data_tools.cpp`.
+  reused by `sql_tools.cpp`). First call returns `input_required` + a `requestState` sealed by
+  `mcp-cpp`'s `RequestStateCodec` (HMAC, bound to the tool name; bound to the Bearer principal over
+  HTTP) and stages a `PendingOp`. Per the spec, the approved retry carries `requestState` +
+  `inputResponses:{confirm:{approved:true}}` at the **tools/call params level** (siblings of
+  `arguments`), not inside `arguments`; the handler verifies the state before executing the staged op.
+  Forged/expired/cross-tool/consumed states are rejected with re-stage guidance; a missing state falls
+  back to the latest matching pending op. `--yes` bypasses the gate (tests/automation only);
+  `--allow-sql` is what registers `db_exec_sql`. Client confirmation payloads are shape-tolerant
+  (`confirm`/`content`/`value`/`params`, `action: accept|decline`) — see `confirmApproved`.
 - **Metadata comes from catalogs, never from querying rows** (the demo's "guess columns by querying"
   fails on empty tables): sqlite `pragma table_info` (via a TVF — a bare `pragma` breaks zorm's
   ` limit 1` column probe), `information_schema`, `user_tab_columns`, or the jsonfile columns array.
   Add a backend's catalog branch in `app.cpp`, not in a tool handler.
 - **Resources are registered as URI templates**, matched at read time, so tables created at runtime
-  are readable without a server restart (deliberately not a startup snapshot).
+  are readable without a server restart (deliberately not a startup snapshot). Writes publish
+  `notifications/resources/updated` + `resources/list_changed`; `buildServer()` declares
+  `resources.subscribe` and `listChanged` so clients may subscribe.
+- **Protocol surface is dual-era.** `acceptLegacyClients(true)` serves `initialize` and requests
+  without `_meta`; modern (2026-07-28) requests go through `server/discover` and per-request `_meta`.
+  All five revisions from 2024-11-05 to 2026-07-28 are advertised. `*/list` and `resources/read` carry
+  `ttlMs`/`cacheScope`; modern results carry `_meta.serverInfo` (mcp-cpp defaults).
+- **HTTP auth is a static bearer seam** (`--http-token`, repeatable). mcp-cpp's transport validates
+  the header and passes the token as the principal; the server never parses tokens itself. Use
+  `--http-origin` for browser origin allowlisting and `--sse-keepalive` for subscription keep-alive.
 - **`instructions` is the primary routing channel** (connect-time decision table); tool descriptions
   carry "use me when / prefer X" hints; error messages teach (cheapest self-correction loop);
   `db://guide` + `db-playbook` are the pull-based fallback for clients without instructions support.
