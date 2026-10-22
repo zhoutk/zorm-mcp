@@ -17,6 +17,7 @@
 #include "DbBase.h"
 #include "json_util.hpp"
 
+#include <algorithm>
 #include <cstdio>
 #include <fstream>
 #include <iostream>
@@ -40,8 +41,12 @@ std::map<std::string, DbSpec> defaultSpecs() {
   std::map<std::string, DbSpec> dbs;
   dbs["sqlite3"] = {"sqlite3", ZORM::Json(
       R"({"connString":"zorm-mcp.db","DbLogClose":true,"parameterized":true})")};
+  // NOT "zorm-mcp.json": that name is the five-backend CONFIG template in the
+  // repo root. Using it as the default data file made the open-box server read
+  // its own config as an empty database and corrupt the template on the first
+  // write (D-01).
   dbs["jsonfile"] = {"jsonfile", ZORM::Json(
-      R"({"connString":"zorm-mcp.json","DbLogClose":true})")};
+      R"({"connString":"zorm-mcp-data.json","DbLogClose":true})")};
   return dbs;
 }
 
@@ -99,9 +104,40 @@ bool loadSpecs(const std::string& configPath, bool allowLogs) {
   return true;
 }
 
+namespace {
+
+// Refuses to use a zorm-mcp CONFIG file as the jsonfile data store. The
+// template (`{"databases":{...}}`) parses as a JSON object, while the jsonfile
+// backend expects an array of table objects; opening it silently produced an
+// empty database and zorm then backed up the config as `.corrupt.*` on the
+// first write (D-01).
+bool jsonfilePathLooksLikeConfig(const ZORM::Json& options) {
+  if (!ZJSON::hasChild(options, "connString")) return false;
+  const std::string file = options["connString"].toString();
+  if (file.empty() || file == "null") return false;
+  std::ifstream in(file, std::ios::binary);
+  if (!in) return false;
+  std::string raw((std::istreambuf_iterator<char>(in)),
+                  std::istreambuf_iterator<char>());
+  std::string err;
+  const mcp::Json doc = mcp::Json::ParseJson(raw, err);
+  return !doc.isError() && doc.isObject() && ZJSON::hasChild(doc, "databases");
+}
+
+}  // namespace
+
 bool openBackends() {
   App& g = app();
   for (const auto& [dbName, spec] : g.specs) {
+    if (spec.type == "jsonfile" && jsonfilePathLooksLikeConfig(spec.options)) {
+      std::cerr << "[zorm-mcp] backend '" << dbName
+                << "': connString points at a zorm-mcp CONFIG file ("
+                << spec.options["connString"].toString()
+                << ") - refusing to use it as a database. Point it at a "
+                   "separate data file (e.g. zorm-mcp-data.json)."
+                << std::endl;
+      return false;
+    }
     auto db = std::unique_ptr<ZORM::Idb>(new ZORM::DbBase(spec.type, spec.options));
     if (!db) {
       std::cerr << "[zorm-mcp] failed to open backend '" << dbName << "' ("
@@ -187,7 +223,20 @@ std::vector<mcp::Json> catalogRows(ZORM::Idb* db, const std::string& sql) {
   return rows;
 }
 
-std::vector<std::string> sqlListTables(ZORM::Idb* db, const std::string& type) {
+// dm8: zorm qualifies every generated statement with db_name as the schema
+// ("dbtest"."table"). Catalogs must query that same owner; the login user's
+// default schema (e.g. SYSDBA) may be different. Empty for other backends.
+std::string dm8Schema(const std::string& dbName) {
+  App& g = app();
+  const auto it = g.specs.find(dbName);
+  if (it == g.specs.end() || it->second.type != "dm8") return "";
+  if (!ZJSON::hasChild(it->second.options, "db_name")) return "";
+  const std::string s = it->second.options["db_name"].toString();
+  return s == "null" ? "" : s;
+}
+
+std::vector<std::string> sqlListTables(ZORM::Idb* db, const std::string& type,
+                                       const std::string& schema) {
   std::vector<std::string> tables;
   std::string sql;
   if (type == "sqlite3") {
@@ -199,7 +248,16 @@ std::vector<std::string> sqlListTables(ZORM::Idb* db, const std::string& type) {
     sql = "select table_name from information_schema.tables "
           "where table_schema = current_schema() and table_type = 'BASE TABLE'";
   } else {  // dm8
-    sql = "select table_name from user_tables";
+    // zorm qualifies every generated statement with db_name as the SCHEMA
+    // ("dbtest"."table"). The login user's current schema can differ
+    // (SYSDBA), so user_tables would list a different set than the tools can
+    // address. Query the same owner zorm targets.
+    if (!schema.empty() && validIdentifier(schema)) {
+      sql = "select table_name from all_tables where upper(owner) = upper('" +
+            schema + "')";
+    } else {
+      sql = "select table_name from user_tables";
+    }
   }
   for (const auto& row : catalogRows(db, sql)) {
     tables.push_back(rowStr(row, {"table_name", "TABLE_NAME", "name", "NAME"}));
@@ -210,7 +268,8 @@ std::vector<std::string> sqlListTables(ZORM::Idb* db, const std::string& type) {
 // pk columns of one table (best-effort per dialect; sqlite gets them from
 // pragma table_info itself, so it is not routed here).
 std::vector<std::string> sqlPrimaryKeys(ZORM::Idb* db, const std::string& type,
-                                        const std::string& table) {
+                                        const std::string& table,
+                                        const std::string& schema) {
   std::vector<std::string> pks;
   if (type == "mysql") {
     for (const auto& row : catalogRows(
@@ -232,12 +291,22 @@ std::vector<std::string> sqlPrimaryKeys(ZORM::Idb* db, const std::string& type,
   } else if (type == "dm8") {
     // CASE_SENSITIVE=Y folds unquoted identifiers to upper case; a table
     // created through zorm (quoted-lowercase DDL) is stored lowercase.
-    // upper() = upper() matches either form.
-    for (const auto& row : catalogRows(
-             db, "select cc.column_name from user_constraints c "
-                 "join user_cons_columns cc on c.constraint_name = cc.constraint_name "
-                 "where c.constraint_type = 'P' and upper(c.table_name) = upper('" +
-                     table + "')")) {
+    // upper() = upper() matches either form. When db_name names a schema,
+    // query all_* so the login user's own schema does not leak in.
+    std::string sql;
+    if (!schema.empty() && validIdentifier(schema)) {
+      sql = "select cc.column_name from all_constraints c "
+            "join all_cons_columns cc on c.owner = cc.owner "
+            "and c.constraint_name = cc.constraint_name "
+            "where c.constraint_type = 'P' and upper(c.owner) = upper('" +
+            schema + "') and upper(c.table_name) = upper('" + table + "')";
+    } else {
+      sql = "select cc.column_name from user_constraints c "
+            "join user_cons_columns cc on c.constraint_name = cc.constraint_name "
+            "where c.constraint_type = 'P' and upper(c.table_name) = upper('" +
+            table + "')";
+    }
+    for (const auto& row : catalogRows(db, sql)) {
       pks.push_back(rowStr(row, {"column_name", "COLUMN_NAME"}));
     }
   }
@@ -245,7 +314,8 @@ std::vector<std::string> sqlPrimaryKeys(ZORM::Idb* db, const std::string& type,
 }
 
 std::vector<ColumnMeta> sqlDescribe(ZORM::Idb* db, const std::string& type,
-                                    const std::string& table) {
+                                    const std::string& table,
+                                    const std::string& schema) {
   std::vector<ColumnMeta> cols;
   if (type == "sqlite3") {
     // Table-valued function form, NOT "pragma table_info(...)": the sqlite
@@ -277,18 +347,29 @@ std::vector<ColumnMeta> sqlDescribe(ZORM::Idb* db, const std::string& type,
           "from information_schema.columns where table_schema = current_schema() "
           "and table_name = '" + table + "' order by ordinal_position";
   } else {  // dm8
-    sql = "select column_name, data_type, nullable, data_default "
-          "from user_tab_columns where table_name = '" + table +
-          "' order by column_id";
+    if (!schema.empty() && validIdentifier(schema)) {
+      sql = "select column_name, data_type, nullable, data_default "
+            "from all_tab_columns where upper(owner) = upper('" +
+            schema + "') and table_name = '" + table + "' order by column_id";
+    } else {
+      sql = "select column_name, data_type, nullable, data_default "
+            "from user_tab_columns where table_name = '" + table +
+            "' order by column_id";
+    }
   }
-  const std::vector<std::string> pks = sqlPrimaryKeys(db, type, table);
+  const std::vector<std::string> pks =
+      sqlPrimaryKeys(db, type, table, schema);
   for (const auto& row : catalogRows(db, sql)) {
     ColumnMeta c;
     c.name = rowStr(row, {"column_name", "COLUMN_NAME"});
     c.type = rowStr(row, {"data_type", "DATA_TYPE"});
-    const std::string nullable = rowStr(row, {"is_nullable", "NULLABLE"});
+    // MySQL's driver folds these to upper case; postgres/sqlite return
+    // lower case, dm8 returns NULLABLE/DATA_DEFAULT (D-04).
+    const std::string nullable =
+        rowStr(row, {"is_nullable", "IS_NULLABLE", "NULLABLE"});
     c.notNull = (nullable == "NO" || nullable == "N");
-    const mcp::Json dflt = rowVal(row, {"column_default", "DATA_DEFAULT"});
+    const mcp::Json dflt =
+        rowVal(row, {"column_default", "COLUMN_DEFAULT", "DATA_DEFAULT"});
     if (!dflt.isNull() && !dflt.isError()) c.dflt = dflt.toString();
     for (const auto& pk : pks) {
       if (pk == c.name) c.pk = true;
@@ -307,14 +388,23 @@ std::vector<std::string> listTables(const std::string& dbName) {
   ZORM::Idb* db = g.db(dbName);
   if (db == nullptr) return {};
   const std::string type = g.specs[dbName].type;
+  std::vector<std::string> tables;
   if (type == "jsonfile") {
-    std::vector<std::string> tables;
     for (const auto& e : jsonfileTables(g.specs[dbName].options)) {
       tables.push_back(e.table);
     }
-    return tables;
+  } else {
+    tables = sqlListTables(db, type, dm8Schema(dbName));
   }
-  return sqlListTables(db, type);
+  // Keep the list consistent with what the structured tools can address:
+  // system/generated names (dm8's ##HISTOGRAMS_TABLE, $INTERNAL, ...) would
+  // only make db_describe_table fail afterwards (D-09).
+  tables.erase(std::remove_if(tables.begin(), tables.end(),
+                              [](const std::string& t) {
+                                return !validIdentifier(t);
+                              }),
+               tables.end());
+  return tables;
 }
 
 std::vector<ColumnMeta> describeTable(const std::string& dbName,
@@ -363,7 +453,7 @@ std::vector<ColumnMeta> describeTable(const std::string& dbName,
         break;
       }
     } else {
-      cols = sqlDescribe(db, type, table);
+      cols = sqlDescribe(db, type, table, dm8Schema(dbName));
     }
   }
   g.schemaCache[dbName][table] = cols;  // cache misses too (empty = unknown)

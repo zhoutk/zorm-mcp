@@ -38,7 +38,9 @@ cd ../.. && ./sync-thirds.sh      # 拉取最新 master 并提交子模块指针
 
 `sync-thirds.sh` 等价于 `git submodule update --remote --merge thirds/zorm thirds/mcp-cpp` 加上自动提交指针变更。子模块已在 master 分支上跟踪各自远端（`.gitmodules` 的 `branch = master`）。
 
-零依赖开箱即用：不配置时内置 `sqlite3`（当前目录 `zorm-mcp.db`）与 `jsonfile`（`zorm-mcp.json`）两个后端。
+零依赖开箱即用：不配置时内置 `sqlite3`（当前目录 `zorm-mcp.db`）与 `jsonfile`（`zorm-mcp-data.json`）两个后端。
+
+> `zorm-mcp.json` 是**五后端配置模板**，不是数据文件。默认数据文件叫 `zorm-mcp-data.json`；如果把配置模板误配成 jsonfile 的 `connString`，服务器会在启动时明确拒绝并退出，避免配置被当作数据库覆盖。
 
 ## 接入 AI 客户端
 
@@ -70,9 +72,9 @@ claude mcp add zorm-mcp -- D:/codes/zorm-mcp/start.sh --config D:/codes/zorm-mcp
 | `db_describe_table` {db, table} | | querySql(内部) | **表字段元数据**：列名/类型/可空/默认值/主键，空表可用（catalog 直查，不靠查表猜列） |
 | `db_indexes` {db, table} | | querySql(内部) | 索引清单（各方言 best-effort） |
 | `db_info` {db} | | querySql(内部) | 后端类型 / 服务器版本 / 连通性 |
-| `db_query` {db, table, …} | | select | 智能查询：fields / lks / ins / ors / group / sum / sort / page / size + 列条件（`{price:">,100"}` 比较前缀） |
+| `db_query` {db, table, …} | | select | 智能查询：fields / lks / ins / ors / group / sum / count / sort / page / size + 列条件（`{price:">,100"}` 比较前缀）。`ins:{age:[18,20]}` = 单列多值；`count/sum:"col,alias"` 或 `{col:alias}`；`size` 可单独用（默认 page=1），`page` 必须与 `size` 同时给 |
 | `db_count` {db, table, where?} | | select | 计数 |
-| `db_query_sql` {db, sql, values?} | | querySql | 参数化**只读** SQL（SELECT/WITH/PRAGMA/SHOW/EXPLAIN；JOIN/方言函数/EXPLAIN 的出口） |
+| `db_query_sql` {db, sql, values?} | | querySql | 参数化**只读** SQL（SELECT/WITH/PRAGMA/SHOW/EXPLAIN；JOIN/方言函数/EXPLAIN 的出口）。`values` 用 `?` 占位符；postgres 由服务端自动改写为 `$1..$n`。允许前置注释，仍拒绝多语句 |
 | `db_insert` {db, table, data} | ✅MRTR | create | 单行插入（缺 id 自动生成） |
 | `db_insert_batch` {db, table, rows, constraint?} | ✅MRTR | insertBatch | 多行 upsert（冲突列默认 id） |
 | `db_update` {db, table, data, where:{id}} | ✅MRTR | update | 单行更新 |
@@ -98,6 +100,15 @@ claude mcp add zorm-mcp -- D:/codes/zorm-mcp/start.sh --config D:/codes/zorm-mcp
 3. **拉取层（兜底）**：`db-playbook` prompt 与 `db://guide` 资源承载完整手册（不支持 instructions 的客户端用）。
 4. **schema 即文档**：`db_describe_table` + resources 让 AI 不猜列名。
 
+## 标识符校验与安全边界
+
+结构化工具（`db_query` / `db_count` / 所有 CRUD / `db_trans` 的结构化元素）只接受**简单标识符**：
+
+- 表名、列名、`fields`、`group`、`sort` 列、`lks/ins/ors` 键、`sum/count` 列与别名、`data` 键、批量 `constraint`：字母/数字/下划线，不能以数字开头。
+- `sort` 只允许 `col [asc|desc][, ...]`；非法输入在构造 SQL **之前**返回 `InvalidParams`，错误信息带 `invalid ... name`。
+- 复杂对象名（含空格、连字符、引号、schema 前缀）请用 `db_query_sql`（或 `--allow-sql` 下的 `db_exec_sql`）显式书写。
+- `db_query_sql` / `db_exec_sql` / `db_trans` 的原始 SQL 文本是显式逃生口，不做标识符校验——这是设计选择，不是遗漏。
+
 ## MRTR 写确认
 
 所有写工具首次调用**不执行**：返回 `resultType=input_required` + `requestState`，确认文案含 目标库/表/影响行数。客户端（AI 转述给用户）批准后，带原参数重试，并在 **tools/call 的 params 层**（与 `arguments` 同级）回传：
@@ -112,6 +123,8 @@ claude mcp add zorm-mcp -- D:/codes/zorm-mcp/start.sh --config D:/codes/zorm-mcp
 ```
 
 `requestState` 由 mcp-cpp 0.4 的 `RequestStateCodec` 做 HMAC 封装：绑定到当前工具（HTTP 模式还绑定认证主体），伪造、跨工具重放、过期都会被拒绝——此时重新发起一次写调用即可重新 stage。对客户端回传的确认形态仍做了宽泛容错（`confirm`/`content`/`value`/`params` 嵌套或顶层 `approved`，以及 `action: accept/decline`）。
+
+**降级批准方式（仅限无法在 params 层回传的客户端）**：把原参数重发一次，并在 `arguments` 对象里加 `"inputResponses":{"confirm":{"approved":true}}`（**不带** `requestState`）。服务器会回退到该 `(db, table, kind)` 最近一次 pending 操作。这条路径没有 state 完整性校验，只应用于受信的本机客户端。
 
 ## 协议与传输（mcp-cpp 0.4）
 
@@ -130,7 +143,6 @@ claude mcp add zorm-mcp -- D:/codes/zorm-mcp/start.sh --config D:/codes/zorm-mcp
 | `--http-token <bearer>` | HTTP 静态 Bearer 鉴权，可重复（多个 token）。未带 `Authorization: Bearer …` 的请求返回 401；token 同时作为 MRTR 状态绑定的 principal |
 | `--http-origin <origin>` | 只允许该 `Origin`（大小写不敏感；无 Origin 的非浏览器客户端仍放行） |
 | `--sse-keepalive <ms>` | 订阅 SSE 流保活间隔，默认 5000；`0` 关闭；`1–99ms` 与 `> 1h` 会被判为错误配置 |
-| `--log-level <level>` | 服务端日志级别下限（debug…emergency）。2026 客户端还需在 `_meta` 里 opt-in；legacy 客户端用 `logging/setLevel` |
 | `--yes` | 关闭 MRTR 确认（自动化/测试专用） |
 | `--allow-sql` | 暴露 `db_exec_sql`（默认隐藏） |
 | `--child` | 内部参数：e2e 测试孵化用 |
@@ -158,7 +170,14 @@ llvm-profdata merge -sparse build-cov/*.profraw -o build-cov/zorm.profdata
 llvm-cov report bin/zorm_mcp_server.exe -instr-profile=build-cov/zorm.profdata
 ```
 
-`./run-test all` 仍是 zorm 核心库的回归门（仅在改动 `thirds/zorm` 时需要）。
+远端方言矩阵（mysql / postgres / dm8，默认跳过，CI 无需远端）：
+
+```bash
+ZORM_MCP_REMOTE_CONFIG=D:/codes/zorm-mcp/zorm-mcp.json \
+  bin/mcp_test_zorm_mcp.exe --gtest_filter=ZormMcpE2E.RemoteBackendsMatrix
+```
+
+`./run-test all` 仍是 zorm 核心库的回归门（改动 `thirds/zorm` 时必须跑）。五后端差异表见 [docs/dialects.md](docs/dialects.md)。
 
 ## 常见问题
 

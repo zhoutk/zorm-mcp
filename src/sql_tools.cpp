@@ -33,7 +33,27 @@ McpResult<Json> unknownDb(const std::string& dbName) {
 // statement smuggling. Anything else belongs in db_exec_sql (if enabled).
 McpResult<Json> checkReadOnlySql(const std::string& sql) {
   size_t i = 0;
-  while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) ++i;
+  // Skip leading whitespace AND comments: "/* c */ select 1" is a read
+  // statement, not a write (D-11). Only the PREFIX is stripped; comments in
+  // the middle do not change the first keyword.
+  while (true) {
+    while (i < sql.size() && std::isspace(static_cast<unsigned char>(sql[i]))) ++i;
+    if (i + 1 < sql.size() && sql[i] == '-' && sql[i + 1] == '-') {
+      const size_t nl = sql.find('\n', i + 2);
+      i = nl == std::string::npos ? sql.size() : nl + 1;
+      continue;
+    }
+    if (i + 1 < sql.size() && sql[i] == '/' && sql[i + 1] == '*') {
+      const size_t end = sql.find("*/", i + 2);
+      if (end == std::string::npos) {
+        return mcp::Err(McpErrorCode::InvalidParams,
+                        "db_query_sql: unterminated block comment");
+      }
+      i = end + 2;
+      continue;
+    }
+    break;
+  }
   static const char* kAllowed[] = {"select", "with", "pragma", "show",
                                    "explain", "describe", "desc"};
   for (const char* kw : kAllowed) {
@@ -88,10 +108,27 @@ McpResult<Json> toolQuerySql(Ctx& c) {
   ZORM::Json zparams;
   const Json namedParams = member(args, "params");
   if (namedParams.isObject()) zparams = toZormJson(namedParams);
-  const ZORM::Json rs = db->querySql(sql, zparams, toZormJson(values));
+
+  // PostgreSQL only understands $n placeholders. Normalize the documented `?`
+  // form so one SQL shape works on every backend (D-07). The rewrite skips
+  // literals/comments/dollar-quotes; a count mismatch is a clear user error.
+  std::string sqlText = sql;
+  if (app().specs[dbName].type == "postgres" && values.size() > 0) {
+    const size_t n = rewritePgPlaceholders(sqlText);
+    if (n > 0 && n != static_cast<size_t>(values.size())) {
+      return mcp::Err(McpErrorCode::InvalidParams,
+                      "SQL has " + std::to_string(n) +
+                          " '?' placeholders but `values` has " +
+                          std::to_string(values.size()) +
+                          " entries (values must match placeholders 1:1)");
+    }
+  }
+
+  const ZORM::Json rs = db->querySql(sqlText, zparams, toZormJson(values));
   if (!okStatus(rs)) {
-    return mcp::Err(McpErrorCode::InvalidParams,
-                    "query failed: " + rs["message"].toString());
+    std::string msg = rs["message"].toString();
+    if (app().specs[dbName].type == "dm8") msg = toUtf8FromGbk(msg);
+    return mcp::Err(McpErrorCode::InvalidParams, "query failed: " + msg);
   }
   return mcp::Ok(toolResult(toMcpJson(rs)));
 }

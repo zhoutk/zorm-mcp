@@ -60,8 +60,26 @@ McpResult<Json> indexRows(const std::string& dbName, const std::string& type,
     sql = "select indexname, indexdef from pg_indexes "
           "where schemaname = current_schema() and tablename = '" + table + "'";
   } else if (type == "dm8") {
-    sql = "select index_name from user_indexes where table_name = '" + table +
-          "' or upper(table_name) = upper('" + table + "')";
+    // zorm's dm8 statements target db_name as the schema; include column and
+    // uniqueness information (the old user_indexes query returned only a name).
+    std::string schema;
+    if (ZJSON::hasChild(app().specs[dbName].options, "db_name"))
+      schema = app().specs[dbName].options["db_name"].toString();
+    if (schema == "null") schema.clear();
+    if (!schema.empty() && validIdentifier(schema)) {
+      sql = "select i.index_name, i.uniqueness, c.column_name, c.column_position "
+            "from all_indexes i left join all_ind_columns c "
+            "on i.owner = c.index_owner and i.index_name = c.index_name "
+            "where upper(i.owner) = upper('" + schema + "') "
+            "and upper(i.table_name) = upper('" + table + "') "
+            "order by i.index_name, c.column_position";
+    } else {
+      sql = "select i.index_name, i.uniqueness, c.column_name, c.column_position "
+            "from user_indexes i left join user_ind_columns c "
+            "on i.index_name = c.index_name "
+            "where upper(i.table_name) = upper('" + table + "') "
+            "order by i.index_name, c.column_position";
+    }
   } else {
     Json result;
     result.add("indexes", Json("[]"));
@@ -70,8 +88,10 @@ McpResult<Json> indexRows(const std::string& dbName, const std::string& type,
   }
   const ZORM::Json rs = db->querySql(sql);
   if (!okStatus(rs)) {
+    std::string msg = rs["message"].toString();
+    if (type == "dm8") msg = toUtf8FromGbk(msg);
     return mcp::Err(McpErrorCode::InvalidParams,
-                    "index lookup failed: " + rs["message"].toString());
+                    "index lookup failed: " + msg);
   }
   Json result;
   result.add("indexes", toMcpJson(rs["data"]));

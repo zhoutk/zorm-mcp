@@ -34,6 +34,8 @@ ctest --test-dir build                    # e2e (stdio+HTTP) + unit + demo suite
   the demo servers, test exes) — `RUNTIME_OUTPUT_DIRECTORY` is set in CMakeLists.
 - Single e2e suite: `ctest --test-dir build -R mcp_test_zorm_mcp -V`
 - Unit suite (pure helpers, no child process): `ctest --test-dir build -R mcp_test_zorm_unit -V`
+- Optional remote matrix (mysql/postgres/dm8; skipped unless the env var is set):
+  `ZORM_MCP_REMOTE_CONFIG=D:/codes/zorm-mcp/.tmp-remote.json bin/mcp_test_zorm_mcp.exe --gtest_filter=ZormMcpE2E.RemoteBackendsMatrix`
 - Single gtest case: `bin/mcp_test_zorm_mcp.exe --gtest_filter=ZormMcpE2E.MrtrWriteConfirmation`
 - Coverage (Clang, optional):
   `cmake --preset clang-rlz -B build-cov -DZORM_MCP_COVERAGE=ON`, build, run ctest with
@@ -64,6 +66,11 @@ revision here:
 cd thirds/zorm && git add -A && git commit -m "..." && git push
 cd ../.. && ./sync-thirds.sh      # = git submodule update --remote --merge + auto-commit the pointer
 ```
+
+`thirds/zorm` carries one local fix on top of upstream master: `MysqlDb::execStmtQuery` now executes
+before fetching result metadata, which makes prepared `EXPLAIN` work (TEST_REPORT D-08). Re-run
+`cd thirds/zorm && ./run-test all` after touching it; the MySQL/pg/dm8 contract tests need the
+10.0.0.7 servers.
 
 Committing inside the submodule alone leaves this repo pointing at the old revision (a later
 `git submodule update` would revert it) — `sync-thirds.sh` exists to fix exactly that. mcp-cpp is
@@ -115,6 +122,16 @@ Key architectural facts:
   back to the latest matching pending op. `--yes` bypasses the gate (tests/automation only);
   `--allow-sql` is what registers `db_exec_sql`. Client confirmation payloads are shape-tolerant
   (`confirm`/`content`/`value`/`params`, `action: accept|decline`) — see `confirmApproved`.
+- **Structured identifiers are validated in `data_tools.cpp`.** zorm inlines table/
+  column/alias/sort names and its default `quoteIdent()` is a no-op on sqlite/mysql/postgres, so
+  `checkWriteArgs` / `checkQueryArgs` (using `validIdentifier` / `validIdentifierList` /
+  `validSortClause` from `json_util`) are the security boundary. Raw SQL tools are explicit escape
+  hatches and are not identifier-checked. Never add a new structured identifier path without routing
+  it through these checks.
+- **dm8 treats `db_name` as the schema** (`"dbtest"."table"`). Its catalogs (`db_list_tables`,
+  `db_describe_table`, `db_indexes`) query `all_*` with `owner = db_name`; `user_*` would describe a
+  different schema when the login user's default schema differs. `db_delete where:{}` uses the same
+  qualified name.
 - **Metadata comes from catalogs, never from querying rows** (the demo's "guess columns by querying"
   fails on empty tables): sqlite `pragma table_info` (via a TVF — a bare `pragma` breaks zorm's
   ` limit 1` column probe), `information_schema`, `user_tab_columns`, or the jsonfile columns array.
@@ -151,7 +168,7 @@ Key architectural facts:
 ## Launcher, config, and the cwd trap
 
 MCP clients each choose the child's cwd (the protocol specifies nothing), and without `--config` the
-default DB files (`zorm-mcp.db` / `zorm-mcp.json`) land in the **process cwd** — so register `start.sh`
+default DB files (`zorm-mcp.db` / `zorm-mcp-data.json`) land in the **process cwd** — so register `start.sh`
 (or `start.cmd`), which pins cwd to the repo root and execs `bin/zorm_mcp_server`. Even then, prefer
 `--config <absolute path>`: a relative `connString` in the config resolves against the **server's**
 cwd (the repo root), not the AI client's project directory. `zorm-mcp.json` is the five-backend

@@ -60,6 +60,47 @@ TEST(JsonUtil, ValidIdentifierWhitelist) {
   EXPECT_FALSE(zorm_mcp::validIdentifier("schema.table"));
 }
 
+TEST(JsonUtil, IdentifierListsAndSortGrammar) {
+  EXPECT_TRUE(zorm_mcp::validIdentifierList("a,b,c"));
+  EXPECT_TRUE(zorm_mcp::validIdentifierList("a"));
+  EXPECT_FALSE(zorm_mcp::validIdentifierList(""));
+  EXPECT_FALSE(zorm_mcp::validIdentifierList("a,1b"));
+  EXPECT_FALSE(zorm_mcp::validIdentifierList("a from t"));
+
+  EXPECT_TRUE(zorm_mcp::validSortClause("score"));
+  EXPECT_TRUE(zorm_mcp::validSortClause("score desc"));
+  EXPECT_TRUE(zorm_mcp::validSortClause("age asc, score desc"));
+  EXPECT_FALSE(zorm_mcp::validSortClause("score desc; drop table t"));
+  EXPECT_FALSE(zorm_mcp::validSortClause("score nulls first"));
+  EXPECT_FALSE(zorm_mcp::validSortClause("1score"));
+}
+
+TEST(JsonUtil, PgPlaceholderRewriteSkipsLiteralsAndComments) {
+  std::string sql = "select '?' as q, \"?\" as c from t where a = ? -- ?\n"
+                    "and b = ? /* ? */ and c = $1 and d = $who$?$who$";
+  const std::size_t n = zorm_mcp::rewritePgPlaceholders(sql);
+  EXPECT_EQ(n, 2u);
+  EXPECT_NE(sql.find("a = $1"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("b = $2"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("'?'"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("-- ?"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("/* ? */"), std::string::npos) << sql;
+  EXPECT_NE(sql.find("c = $1"), std::string::npos) << sql;  // existing $n
+  EXPECT_NE(sql.find("$who$?$who$"), std::string::npos) << sql;
+}
+
+TEST(JsonUtil, GbkErrorTextBecomesUtf8) {
+  // GBK bytes for "错误" (0xB4ED 0xCEF3); already-UTF-8 input is unchanged.
+  const std::string gbk("\xB4\xED\xCE\xF3");
+#ifdef _WIN32
+  EXPECT_EQ(zorm_mcp::toUtf8FromGbk(gbk), "\xE9\x94\x99\xE8\xAF\xAF");
+#else
+  EXPECT_EQ(zorm_mcp::toUtf8FromGbk(gbk), gbk);  // no transcoder off Windows
+#endif
+  const std::string utf8 = "\xE9\x94\x99\xE8\xAF\xAF";
+  EXPECT_EQ(zorm_mcp::toUtf8FromGbk(utf8), utf8);
+}
+
 TEST(JsonUtil, BridgeRoundTripsValues) {
   const Json src = Json(R"({"a":1,"b":"two","c":[true,false]})");
   const Json back = zorm_mcp::toMcpJson(zorm_mcp::toZormJson(src));

@@ -10,6 +10,7 @@ out/
 *.db
 *.json
 !zorm-mcp.json
+*.corrupt.*
 demo/zorm-mcp/
 
 # llvm-cov profiles

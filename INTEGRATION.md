@@ -24,7 +24,7 @@ cmake --preset clang-rlz && cmake --build build
 
 ### 0.2 接入命令用哪个：**统一用 `start.sh` 包装脚本（推荐，MSYS2 标准示范）**
 
-AI 客户端各自决定子进程的工作目录（cwd），**MCP 协议对此没有任何约定**——同一个注册配置，Claude Code、Claude Desktop、Cursor 各自 spawn 出来的 cwd 都不一样。zorm-mcp 不带 `--config` 时，默认数据库文件（`zorm-mcp.db` / `zorm-mcp.json`）落在**进程 cwd**，所以"库到底在哪"会随客户端漂移。包装脚本把 cwd 钉死到 `zorm-mcp/` 目录，文件位置从此可预期：
+AI 客户端各自决定子进程的工作目录（cwd），**MCP 协议对此没有任何约定**——同一个注册配置，Claude Code、Claude Desktop、Cursor 各自 spawn 出来的 cwd 都不一样。zorm-mcp 不带 `--config` 时，默认数据库文件（`zorm-mcp.db` / `zorm-mcp-data.json`；`zorm-mcp.json` 是配置模板，不能当数据文件）落在**进程 cwd**，所以"库到底在哪"会随客户端漂移。包装脚本把 cwd 钉死到 `zorm-mcp/` 目录，文件位置从此可预期：
 
 | 形式 | 命令 | 适用 |
 | --- | --- | --- |
@@ -61,6 +61,8 @@ demo 是在项目目录里手工启动 server 的，库文件自然落在当时�
 - `requestState` 是 HMAC 封装的不可编辑 token，绑定工具（HTTP 下还绑定 Bearer principal）：伪造/跨工具/跨账号/过期一律拒绝，重新发起写调用即可重新 stage。
 - `--yes` 关闭确认（自动化/测试专用）；`--allow-sql` 才会注册 `db_exec_sql`（任意写/DDL SQL）。
 - 客户端若支持 elicitation 会弹原生确认框；不支持时由 AI 转述，效果等价。
+- **客户端无法在 params 层回传时（降级通道，O-02）**：重发原参数，并在 `arguments` 内加 `"inputResponses":{"confirm":{"approved":true}}`，不要带 `requestState`。服务器回退到该 `(db, table, kind)` 最近的 pending 操作。该通道没有 state 完整性校验，仅用于受信本机客户端。
+- 方言差异（占位符、标识符引号、分页、元数据大小写）见 [docs/dialects.md](docs/dialects.md)。
 
 ### 0.5 接入后 30 秒自检
 

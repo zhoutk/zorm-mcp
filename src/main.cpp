@@ -58,7 +58,7 @@ std::string makeStateKey() {
 }
 
 // Builds the MCP server with the full tool/resource/prompt surface.
-std::shared_ptr<Server> buildServer(const std::string& logLevel) {
+std::shared_ptr<Server> buildServer() {
   zorm_mcp::App& g = zorm_mcp::app();
   Builder b;
   b.acceptLegacyClients(true);  // Claude Code / VS Code speak legacy initialize
@@ -83,9 +83,8 @@ std::shared_ptr<Server> buildServer(const std::string& logLevel) {
     return nullptr;
   }
   b.requestStateCodec(std::move(codec.value()));
-  if (!logLevel.empty()) b.logLevel(logLevel);
 
-  b.name("zorm-mcp").version("1.1.0").instructions(zorm_mcp::instructionsText());
+  b.name("zorm-mcp").version("1.1.1").instructions(zorm_mcp::instructionsText());
 
   zorm_mcp::registerMetaTools(b);
   zorm_mcp::registerDataTools(b);
@@ -112,7 +111,6 @@ int main(int argc, char** argv) {
   int sseKeepAliveMs = 5000;  // mcp-cpp default, stated here for --help
   std::string configPath;
   std::string httpOrigin;
-  std::string logLevel;
   std::vector<std::string> httpTokens;
   for (int i = 1; i < argc; ++i) {
     const std::string a = argv[i];
@@ -125,8 +123,6 @@ int main(int argc, char** argv) {
       httpOrigin = argv[++i];
     } else if (a == "--sse-keepalive" && i + 1 < argc) {
       sseKeepAliveMs = std::atoi(argv[++i]);
-    } else if (a == "--log-level" && i + 1 < argc) {
-      logLevel = argv[++i];
     } else if (a == "--yes") {
       g.confirmWrites = false;
     } else if (a == "--allow-sql") {
@@ -139,14 +135,14 @@ int main(int argc, char** argv) {
       std::cout << "zorm-mcp - multi-backend database MCP server (zorm + mcp-cpp)\n"
                    "usage: zorm_mcp_server [--config <file>] [--http <port>]\n"
                    "                       [--http-token <bearer>]... [--http-origin <origin>]\n"
-                   "                       [--sse-keepalive <ms>] [--log-level <level>]\n"
+                   "                       [--sse-keepalive <ms>]\n"
                    "                       [--yes] [--allow-sql] [--child]\n"
                    "default mode is stdio; see README.md for client registration\n";
       return 0;
     } else {
       std::cerr << "usage: zorm_mcp_server [--config <file>] [--http <port>] "
                    "[--http-token <bearer>]... [--http-origin <origin>] "
-                   "[--sse-keepalive <ms>] [--log-level <level>] [--yes] "
+                   "[--sse-keepalive <ms>] [--yes] "
                    "[--allow-sql] [--child]\n";
       return 2;
     }
@@ -156,7 +152,7 @@ int main(int argc, char** argv) {
   if (!zorm_mcp::openBackends()) return 1;
   zorm_mcp::discoverAllSchemas();
 
-  auto server = buildServer(logLevel);
+  auto server = buildServer();
   if (!server) return 1;
 
   // --http: HTTP-ONLY serving (stdio not run).

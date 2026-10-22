@@ -10,6 +10,7 @@
 #include <algorithm>
 #include <cctype>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -29,6 +30,275 @@ McpResult<Json> unknownDb(const std::string& dbName) {
                       ") - `db` is the backend NAME, see the server instructions");
 }
 
+// ---- structured-identifier validation --------------------------------------------
+//
+// zorm inlines table/column/alias/sort names into SQL and its default
+// quoteIdent() is a no-op on sqlite/mysql/postgres. Every structured
+// identifier therefore has to be validated HERE; raw SQL tools
+// (db_query_sql / db_exec_sql / db_trans text elements) are explicit escape
+// hatches and are intentionally not identifier-checked.
+
+std::string trimCopy(const std::string& s) {
+  size_t a = 0, b = s.size();
+  while (a < b && std::isspace(static_cast<unsigned char>(s[a]))) ++a;
+  while (b > a && std::isspace(static_cast<unsigned char>(s[b - 1]))) --b;
+  return s.substr(a, b - a);
+}
+
+std::vector<std::string> splitCsv(const std::string& s) {
+  std::vector<std::string> out;
+  size_t start = 0;
+  while (true) {
+    const size_t pos = s.find(',', start);
+    out.push_back(s.substr(start, pos == std::string::npos ? std::string::npos
+                                                           : pos - start));
+    if (pos == std::string::npos) break;
+    start = pos + 1;
+  }
+  return out;
+}
+
+std::optional<std::string> badIdent(const std::string& what,
+                                    const std::string& value) {
+  if (validIdentifier(value)) return std::nullopt;
+  return "invalid " + what + " name: '" + value +
+         "' (letters/digits/underscore, not starting with a digit; complex "
+         "names belong in db_query_sql)";
+}
+
+std::optional<std::string> checkObjectKeys(const Json& obj,
+                                           const std::string& what) {
+  if (!obj.isObject()) return std::nullopt;
+  for (const auto& k : obj.getAllKeys().toVector()) {
+    if (auto e = badIdent(what, k.toString())) return e;
+  }
+  return std::nullopt;
+}
+
+// Validates the friendly shapes accepted for sum/count:
+//   {"col":"alias"}; ["col"] or ["col,alias"]; "col,alias" or "c1,a1,c2,a2"
+std::optional<std::string> checkAggSpec(const Json& v,
+                                        const std::string& key) {
+  if (v.isObject()) {
+    for (const auto& k : v.getAllKeys().toVector()) {
+      const std::string col = k.toString();
+      if (!(key == "count" && col == "*")) {
+        if (auto e = badIdent(key + " column", col)) return e;
+      }
+      const std::string alias = v[col].toString();
+      if (!alias.empty()) {
+        if (auto e = badIdent(key + " alias", alias)) return e;
+      }
+    }
+    return std::nullopt;
+  }
+  if (v.isArray()) {
+    for (const auto& item : v.toVector()) {
+      const auto parts = splitCsv(item.toString());
+      if (parts.size() < 1 || parts.size() > 2)
+        return key + " entries must be 'col' or 'col,alias'";
+      for (const auto& p : parts) {
+        const std::string token = trimCopy(p);
+        if (key == "count" && token == "*") continue;
+        if (auto e = badIdent(key + " column/alias", token)) return e;
+      }
+    }
+    return std::nullopt;
+  }
+  if (v.isString()) {
+    const auto parts = splitCsv(v.toString());
+    // "col" is accepted as shorthand for "col,col" (alias = column); the
+    // longer form is always col,alias[,col,alias...].
+    if (parts.size() > 1 && parts.size() % 2 != 0)
+      return key + " string form must be 'col' or 'col,alias[,col,alias...]'";
+    for (const auto& p : parts) {
+      const std::string token = trimCopy(p);
+      if (key == "count" && token == "*") continue;  // count(*) is legitimate
+      if (auto e = badIdent(key + " column/alias", token)) return e;
+    }
+    return std::nullopt;
+  }
+  return key + " must be an object, an array, or a string";
+}
+
+// Aliases produced by sum/count, used to normalize dm8's string-typed
+// aggregate values back to JSON numbers (D-12).
+std::vector<std::string> aggregateAliases(const Json& args) {
+  std::vector<std::string> aliases;
+  for (const char* key : {"sum", "count"}) {
+    const Json v = member(args, key);
+    if (!v.isObject() && !v.isArray() && !v.isString()) continue;
+    if (v.isObject()) {
+      for (const auto& k : v.getAllKeys().toVector()) {
+        const std::string col = k.toString();
+        const std::string alias = v[col].toString();
+        aliases.push_back(alias.empty() ? col : alias);
+      }
+    } else if (v.isArray()) {
+      for (const auto& item : v.toVector()) {
+        const auto parts = splitCsv(item.toString());
+        aliases.push_back(trimCopy(parts.size() > 1 ? parts[1] : parts[0]));
+      }
+    } else {
+      const auto parts = splitCsv(v.toString());
+      if (parts.size() == 1) aliases.push_back(trimCopy(parts[0]));
+      for (size_t i = 1; i < parts.size(); i += 2)
+        aliases.push_back(trimCopy(parts[i]));
+    }
+  }
+  return aliases;
+}
+
+std::optional<std::string> checkSortSpec(const Json& v) {
+  if (v.isString()) {
+    if (!validSortClause(v.toString()))
+      return "invalid sort: '" + v.toString() +
+             "' (expected 'col [asc|desc], col2 ...')";
+    return std::nullopt;
+  }
+  if (v.isArray()) {
+    for (const auto& item : v.toVector()) {
+      const std::string s = item.toString();
+      if (!validSortClause(s))
+        return "invalid sort: '" + s + "' (expected 'col [asc|desc]')";
+    }
+    return std::nullopt;
+  }
+  return "sort must be a string or an array of strings";
+}
+
+// Reserved db_query keys (not column conditions).
+bool isReservedQueryKey(const std::string& k) {
+  static const char* kReserved[] = {
+      "db",     "table",  "fields", "lks",   "ins",    "ors",   "group",
+      "sort",   "sum",    "count",  "fuzzy", "page",   "size",  "requestState",
+      "inputResponses", "approved", "constraint", "rows"};
+  return std::any_of(std::begin(kReserved), std::end(kReserved),
+                     [&](const char* r) { return k == r; });
+}
+
+std::optional<std::string> checkQueryArgs(const Json& args) {
+  const Json fields = member(args, "fields");
+  if (fields.isArray()) {
+    for (const auto& f : fields.toVector()) {
+      const std::string name = f.toString();
+      if (auto e = badIdent("field", name)) return e;
+    }
+  } else if (!fields.isNull() && !fields.isError()) {
+    return "fields must be an array of column names";
+  }
+
+  const Json group = member(args, "group");
+  if (group.isArray()) {
+    for (const auto& g : group.toVector()) {
+      if (auto e = badIdent("group column", g.toString())) return e;
+    }
+  } else if (group.isString()) {
+    if (!validIdentifierList(group.toString()))
+      return "invalid group: '" + group.toString() + "'";
+  } else if (!group.isNull() && !group.isError()) {
+    return "group must be an array or a comma-separated string";
+  }
+
+  const Json sort = member(args, "sort");
+  if (!sort.isNull() && !sort.isError()) {
+    if (auto e = checkSortSpec(sort)) return e;
+  }
+
+  for (const char* key : {"lks", "ins", "ors"}) {
+    const Json v = member(args, key);
+    if (v.isNull() || v.isError()) continue;
+    if (!v.isObject())
+      return std::string(key) + " must be an object {column: value|values}";
+    if (auto e = checkObjectKeys(v, std::string(key) + " column")) return e;
+  }
+  for (const char* key : {"sum", "count"}) {
+    const Json v = member(args, key);
+    if (v.isNull() || v.isError()) continue;
+    if (auto e = checkAggSpec(v, key)) return e;
+  }
+  for (const auto& k : args.getAllKeys().toVector()) {
+    const std::string key = k.toString();
+    if (isReservedQueryKey(key)) continue;
+    if (auto e = badIdent("condition column", key)) return e;
+  }
+  return std::nullopt;
+}
+
+// Validates a structured db_trans element (raw text/sql elements are skipped:
+// they ARE the escape hatch).
+std::optional<std::string> checkTransElements(const Json& sqls) {
+  if (!sqls.isArray()) return "db_trans requires `sqls` to be an array";
+  for (const auto& item : sqls.toVector()) {
+    if (!item.isObject()) return "db_trans elements must be objects";
+    if (ZJSON::hasChild(item, "text") || ZJSON::hasChild(item, "sql")) continue;
+    const std::string table = member(item, "table").toString();
+    if (auto e = badIdent("transaction table", table)) return e;
+    std::string method = member(item, "method").toString();
+    for (auto& ch : method)
+      ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    if (method != "insert" && method != "update" && method != "delete" &&
+        method != "batch")
+      return "db_trans structured method must be insert|update|delete|batch";
+    const Json params = member(item, "params");
+    if (!params.isNull() && !params.isError()) {
+      if (!params.isObject()) return "db_trans element params must be an object";
+      if (auto e = checkObjectKeys(params, "transaction column")) return e;
+    }
+  }
+  return std::nullopt;
+}
+
+// Validates table + payload identifiers for a write kind. Called both when
+// staging (so the confirmation text never shows an injected target) and when
+// executing (defense in depth).
+std::optional<std::string> checkWriteArgs(const std::string& kind,
+                                          const Json& args) {
+  const std::string table = member(args, "table").toString();
+  if (kind == "exec_sql") {
+    if (member(args, "sql").toString().empty()) return "sql is required";
+    return std::nullopt;  // raw SQL escape hatch
+  }
+  if (kind == "trans") return checkTransElements(member(args, "sqls"));
+  if (auto e = badIdent("table", table)) return e;
+
+  if (kind == "insert" || kind == "update") {
+    const Json data = member(args, "data");
+    if (!data.isObject()) return kind + " requires `data` to be an object";
+    if (auto e = checkObjectKeys(data, "column")) return e;
+    if (kind == "update") {
+      const Json where = member(args, "where");
+      if (!where.isObject() || !ZJSON::hasChild(where, "id"))
+        return "db_update requires where:{\"id\": <value>} (single-row update) - "
+               "for condition-based updates use db_trans with a structured "
+               "update element (or db_exec_sql with --allow-sql)";
+    }
+  } else if (kind == "insert_batch") {
+    const Json rows = member(args, "rows");
+    if (!rows.isArray() || rows.size() < 1)
+      return "db_insert_batch requires `rows` to be a non-empty array";
+    for (const auto& row : rows.toVector()) {
+      if (!row.isObject()) return "each row must be an object";
+      if (auto e = checkObjectKeys(row, "column")) return e;
+    }
+    const Json constraint = member(args, "constraint");
+    if (constraint.isString() && !constraint.toString().empty()) {
+      if (auto e = badIdent("constraint", constraint.toString())) return e;
+    }
+  } else if (kind == "delete") {
+    const Json where = member(args, "where");
+    if (!where.isObject()) return "db_delete requires `where` to be an object";
+    for (const auto& k : where.getAllKeys().toVector()) {
+      if (auto e = badIdent("where column", k.toString())) return e;
+    }
+  }
+  return std::nullopt;
+}
+
+McpResult<Json> invalidArgs(const std::string& message) {
+  return mcp::Err(McpErrorCode::InvalidParams, message);
+}
+
 // ---- db_query argument conversion -------------------------------------------------
 //
 // zorm's smart-query shapes (verified against SqlBackendBase::genSql):
@@ -40,7 +310,8 @@ McpResult<Json> unknownDb(const std::string& dbName) {
 // here. Values are assumed simple (no embedded commas) - documented in the
 // playbook.
 
-void convertPairsObject(const Json& v, std::string& joined) {
+void convertPairsObject(const Json& v, std::string& joined,
+                        bool sameKeyForArray) {
   for (const auto& k : v.getAllKeys().toVector()) {
     const std::string kk = k.toString();
     const Json vv = v[kk];
@@ -48,10 +319,17 @@ void convertPairsObject(const Json& v, std::string& joined) {
       if (!joined.empty()) joined += ",";
       joined += kk + "," + vv.toString();
     } else if (vv.isArray()) {
-      // ins/ors accept multi-value lists: {id:["a","b"]} -> "id,a,b"
-      for (const auto& item : vv.toVector()) {
+      if (sameKeyForArray) {
+        // ins: {age:[18,20]} -> "age,18,20" (ONE column, N values).
         if (!joined.empty()) joined += ",";
-        joined += kk + "," + item.toString();
+        joined += kk;
+        for (const auto& item : vv.toVector()) joined += "," + item.toString();
+      } else {
+        // lks/ors: every value is a separate condition -> "col,v,col,v".
+        for (const auto& item : vv.toVector()) {
+          if (!joined.empty()) joined += ",";
+          joined += kk + "," + item.toString();
+        }
       }
     }
     // object values are not supported by the pair encoding
@@ -75,9 +353,9 @@ void convertStringLists(const Json& args, ZORM::Json& params, bool stripWildcard
           val.erase(std::remove(val.begin(), val.end(), '%'), val.end());
           stripped.add(k.toString(), Json::str(val));
         }
-        convertPairsObject(stripped, joined);
+        convertPairsObject(stripped, joined, false);
       } else {
-        convertPairsObject(v, joined);
+        convertPairsObject(v, joined, std::string(key) == "ins");
       }
       if (!joined.empty()) params.add(key, ZORM::Json(joined.c_str()));
     } else if (v.isString() || v.isArray()) {
@@ -99,7 +377,10 @@ void convertStringLists(const Json& args, ZORM::Json& params, bool stripWildcard
       params.add(key, toZormJson(v));
     }
   }
-  // sum/count: {col:alias} or ["col"] or "col" -> "col,alias" pairs
+  // sum/count: zorm consumes "col,alias[,col,alias...]" pairs.
+  //   object {col:alias}  -> col,alias (alias defaults to the column)
+  //   array  ["col"]      -> col,col   (["col,alias"] passes through)
+  //   string "col,alias"  -> unchanged (validated upstream)
   for (const char* key : {"sum", "count"}) {
     const Json v = member(args, key);
     if (v.isError() || v.isNull()) continue;
@@ -118,12 +399,15 @@ void convertStringLists(const Json& args, ZORM::Json& params, bool stripWildcard
         const std::string s = item.toString();
         if (s.empty()) continue;
         if (!joined.empty()) joined += ",";
-        joined += s + "," + s;  // alias defaults to the column name
+        joined += s.find(',') == std::string::npos ? s + "," + s : s;
       }
       if (!joined.empty()) params.add(key, ZORM::Json(joined.c_str()));
     } else if (v.isString()) {
       const std::string s = v.toString();
-      if (!s.empty()) params.add(key, ZORM::Json((s + "," + s).c_str()));
+      if (!s.empty())
+        params.add(key, ZORM::Json(
+                            (s.find(',') == std::string::npos ? s + "," + s : s)
+                                .c_str()));
     }
   }
   // scalars
@@ -226,6 +510,8 @@ McpResult<Json> executeWrite(const std::string& dbName, const std::string& table
   App& g = app();
   ZORM::Idb* db = g.db(dbName);
   if (db == nullptr) return unknownDb(dbName);
+  if (auto e = checkWriteArgs(kind, args)) return invalidArgs(*e);
+  const DbSpec& spec = g.specs[dbName];
 
   ZORM::Json rs;
   if (kind == "insert") {
@@ -309,7 +595,17 @@ McpResult<Json> executeWrite(const std::string& dbName, const std::string& table
           rs = out;
         }
       } else {
-        rs = db->execSql("delete from " + table);
+        // dm8 needs the schema-qualified quoted name (unquoted identifiers
+        // fold to upper case there and miss zorm's quoted-lowercase DDL).
+        std::string target = table;
+        if (spec.type == "dm8") {
+          std::string schema;
+          if (ZJSON::hasChild(spec.options, "db_name"))
+            schema = spec.options["db_name"].toString();
+          target = schema.empty() ? "\"" + table + "\""
+                                  : "\"" + schema + "\".\"" + table + "\"";
+        }
+        rs = db->execSql("delete from " + target);
       }
     } else {
       return mcp::Err(McpErrorCode::InvalidParams,
@@ -319,7 +615,25 @@ McpResult<Json> executeWrite(const std::string& dbName, const std::string& table
                       "or query ids with db_query and delete them one by one");
     }
   } else if (kind == "exec_sql") {
-    rs = db->execSql(member(args, "sql").toString());
+    std::string sql = member(args, "sql").toString();
+    const Json values = member(args, "values");
+    ZORM::Json zvals(R"([])");
+    if (values.isArray()) zvals = toZormJson(values);
+    if (spec.type == "postgres" && zvals.size() > 0) {
+      std::string rewritten = sql;
+      const size_t n = rewritePgPlaceholders(rewritten);
+      if (n > 0) {
+        if (n != static_cast<size_t>(zvals.size())) {
+          return mcp::Err(McpErrorCode::InvalidParams,
+                          "SQL has " + std::to_string(n) +
+                              " '?' placeholders but `values` has " +
+                              std::to_string(zvals.size()) +
+                              " entries (values must match placeholders 1:1)");
+        }
+        sql = rewritten;
+      }
+    }
+    rs = db->execSql(sql, ZORM::Json(), zvals);
   } else if (kind == "trans") {
     const Json sqls = member(args, "sqls");
     if (!sqls.isArray() || sqls.size() < 1) {
@@ -332,6 +646,27 @@ McpResult<Json> executeWrite(const std::string& dbName, const std::string& table
     ZORM::Json zsqls(R"([])");
     for (const auto& item : sqls.toVector()) {
       ZORM::Json el = toZormJson(item);
+      // PostgreSQL uses $n placeholders. Normalize `?` in raw text elements
+      // so one SQL shape works on every backend.
+      if (spec.type == "postgres" &&
+          (ZJSON::hasChild(el, "text") || ZJSON::hasChild(el, "sql"))) {
+        const char* key = ZJSON::hasChild(el, "text") ? "text" : "sql";
+        std::string text = el[key].toString();
+        size_t valueCount = 0;
+        if (ZJSON::hasChild(el, "values") && el["values"].isArray())
+          valueCount = static_cast<size_t>(el["values"].size());
+        const size_t n = rewritePgPlaceholders(text);
+        if (n > 0) {
+          if (n != valueCount) {
+            return mcp::Err(McpErrorCode::InvalidParams,
+                            "transaction element has " + std::to_string(n) +
+                                " '?' placeholders but " +
+                                std::to_string(valueCount) +
+                                " values (must match 1:1)");
+          }
+          ZJSON::setChild(el, key, ZORM::Json::str(text));
+        }
+      }
       if (ZJSON::hasChild(el, "method")) {
         std::string m = el["method"].toString();
         for (auto& ch : m)
@@ -356,6 +691,7 @@ McpResult<Json> executeWrite(const std::string& dbName, const std::string& table
     // relative - the resolved path is what matters when the client-spawned
     // cwd differs from the repo root).
     std::string msg = rs["message"].toString();
+    if (spec.type == "dm8") msg = toUtf8FromGbk(msg);
     const std::string raw = "Error Code : ";
     const size_t pos = msg.find(raw);
     if (pos != std::string::npos) {
@@ -372,12 +708,20 @@ McpResult<Json> executeWrite(const std::string& dbName, const std::string& table
       else if (code == "14")
         msg += " (SQLITE_CANTOPEN: the database file cannot be opened - wrong path or no permission)";
     }
-    std::string file = g.specs[dbName].options["connString"].toString();
-    try {
-      file = std::filesystem::absolute(file).string();
-    } catch (...) {
+    // Only file-backed backends have a connString. Server backends used to
+    // print "[file: <repo root>]" because a missing connString renders as
+    // "null" - which misleads the AI and the user (D-12).
+    std::string conn;
+    if (ZJSON::hasChild(spec.options, "connString"))
+      conn = spec.options["connString"].toString();
+    if (!conn.empty() && conn != "null") {
+      try {
+        conn = std::filesystem::absolute(conn).string();
+      } catch (...) {
+      }
+      msg += " [file: " + conn + "]";
     }
-    return mcp::Err(McpErrorCode::InternalError, "write failed: " + msg + " [file: " + file + "]");
+    return mcp::Err(McpErrorCode::InternalError, "write failed: " + msg);
   }
 
   // Notify resource subscribers that this table changed (mcp-cpp fan-out).
@@ -387,7 +731,18 @@ McpResult<Json> executeWrite(const std::string& dbName, const std::string& table
     }
     srv->notifyListChanged("resources");
   }
-  return mcp::Ok(toolResult(toMcpJson(rs)));
+  // Envelope normalization (D-12): expose both affected/affectedRows, and do
+  // not report a single insertId for a multi-row batch.
+  Json out = toMcpJson(rs);
+  if (out.isObject()) {
+    if (!ZJSON::hasChild(out, "affected") && ZJSON::hasChild(out, "affectedRows"))
+      out.add("affected", out["affectedRows"]);
+    if (!ZJSON::hasChild(out, "affectedRows") && ZJSON::hasChild(out, "affected"))
+      out.add("affectedRows", out["affected"]);
+    if (kind == "insert_batch" && ZJSON::hasChild(out, "insertId"))
+      out.remove("insertId");
+  }
+  return mcp::Ok(toolResult(out));
 }
 
 // Stages a write and returns input_required (or executes directly with --yes
@@ -400,6 +755,9 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
   const std::string table = args["table"].toString();
   ZORM::Idb* db = g.db(dbName);
   if (db == nullptr) return unknownDb(dbName);
+  // Validate BEFORE staging: the confirmation text must never show an injected
+  // target, and an approved retry must re-validate as defense in depth.
+  if (auto e = checkWriteArgs(kind, args)) return invalidArgs(*e);
 
   // MRTR retry detection. Per the spec the retry carries `requestState` and
   // `inputResponses` at the tools/call PARAMS level (siblings of `arguments`),
@@ -500,8 +858,6 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
       result.add("content", Json(R"([{"type":"text","text":"Write cancelled by user."}])"));
       return mcp::Ok(std::move(result));
     }
-    c.log("info", "zorm-mcp: approved " + op.kind + " on " + op.db +
-                      (op.table.empty() ? "" : "." + op.table));
     return executeWrite(op.db, op.table, op.kind, op.args);
   }
 
@@ -546,13 +902,9 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
                             (table.empty() ? "" : "." + table) + " (" + impact +
                             ")? Reply with approved:true to proceed (requestState: " +
                             sealed.value() + ").";
-    c.log("info", "zorm-mcp: staged " + kind + " on " + dbName +
-                      (table.empty() ? "" : "." + table));
     return mcp::Ok(inputRequiredConfirm(sealed.value(), msg));
   }
   // --yes: execute immediately (tests / automation).
-  c.log("info", "zorm-mcp: executing " + kind + " on " + dbName +
-                    (table.empty() ? "" : "." + table) + " (confirmation disabled)");
   return executeWrite(dbName, table, kind, args);
 }
 
@@ -567,10 +919,32 @@ McpResult<Json> toolQuery(Ctx& c) {
   if (table.empty()) {
     return mcp::Err(McpErrorCode::InvalidParams, "table is required");
   }
+  if (auto e = badIdent("table", table)) return invalidArgs(*e);
+  if (auto e = checkQueryArgs(args)) return invalidArgs(*e);
 
   ZORM::Json params;
   const bool jsonfileBackend = app().specs[dbName].type == "jsonfile";
   convertStringLists(args, params, jsonfileBackend);
+
+  // Pagination normalization (D-10): zorm only paginates when page > 0.
+  //   size only -> page 1; page only -> explicit error (limit 0,0 otherwise)
+  const Json pageV = member(args, "page");
+  const Json sizeV = member(args, "size");
+  const bool havePage = pageV.isNumber();
+  const bool haveSize = sizeV.isNumber();
+  if (havePage != haveSize) {
+    if (havePage) {
+      return invalidArgs(
+          "page requires size: pass both (page starts at 1), e.g. "
+          "{\"page\":1,\"size\":20}");
+    }
+    params.add("page", Json(static_cast<int64_t>(1)));
+  }
+  if (haveSize) {
+    const long long size = sizeV.toInt64();
+    if (size < 1 || size > 500)
+      return invalidArgs("size must be between 1 and 500");
+  }
   // Remaining keys pass through as plain column conditions: {"price":100}
   // equal, or a compare-prefix string {"price":">,100"} (zorm prefixes
   // >, >=, <, <=, <>, =).
@@ -598,10 +972,43 @@ McpResult<Json> toolQuery(Ctx& c) {
 
   const ZORM::Json rs = db->select(table, params, fields);
   if (!okStatus(rs)) {
-    return mcp::Err(McpErrorCode::InvalidParams,
-                    "query failed: " + rs["message"].toString());
+    std::string msg = rs["message"].toString();
+    if (app().specs[dbName].type == "dm8") msg = toUtf8FromGbk(msg);
+    return mcp::Err(McpErrorCode::InvalidParams, "query failed: " + msg);
   }
-  return mcp::Ok(toolResult(toMcpJson(rs)));
+
+  // dm8 returns aggregates as strings; convert the aliases THIS request asked
+  // for (never arbitrary columns that merely look numeric).
+  Json out = toMcpJson(rs);
+  const std::vector<std::string> aliases = aggregateAliases(args);
+  const Json data = member(out, "data");
+  if (!aliases.empty() && data.isArray() && data.size() > 0) {
+    Json arr = Json("[]");
+    for (const auto& row : data.toVector()) {
+      Json normalized = row;
+      for (const auto& alias : aliases) {
+        const Json v = member(normalized, alias);
+        if (!v.isString()) continue;
+        const std::string s = v.toString();
+        try {
+          size_t used = 0;
+          if (s.find_first_of(".eE") == std::string::npos) {
+            const long long n = std::stoll(s, &used);
+            if (used == s.size())
+              ZJSON::setChild(normalized, alias, Json(n));
+          } else {
+            const double d = std::stod(s, &used);
+            if (used == s.size())
+              ZJSON::setChild(normalized, alias, Json(d));
+          }
+        } catch (...) {
+        }
+      }
+      arr.push_back(std::move(normalized));
+    }
+    ZJSON::setChild(out, "data", arr);
+  }
+  return mcp::Ok(toolResult(out));
 }
 
 McpResult<Json> toolCount(Ctx& c) {
@@ -613,12 +1020,14 @@ McpResult<Json> toolCount(Ctx& c) {
   if (table.empty()) {
     return mcp::Err(McpErrorCode::InvalidParams, "table is required");
   }
+  if (auto e = badIdent("table", table)) return invalidArgs(*e);
 
   // zorm count expects a "col,alias" pair (e.g. "*,total"); optional where
   // keys merge into params as top-level conditions (zorm select semantics).
   ZORM::Json params;
   const Json where = member(args, "where");
   if (where.isObject()) {
+    if (auto e = checkObjectKeys(where, "where column")) return invalidArgs(*e);
     for (const auto& k : where.getAllKeys().toVector()) {
       const std::string kk = k.toString();
       params.add(kk, toZormJson(where[kk]));
@@ -627,10 +1036,31 @@ McpResult<Json> toolCount(Ctx& c) {
   params.add("count", ZORM::Json("*,total"));
   const ZORM::Json rs = db->select(table, params);
   if (!okStatus(rs)) {
-    return mcp::Err(McpErrorCode::InvalidParams,
-                    "count failed: " + rs["message"].toString());
+    std::string msg = rs["message"].toString();
+    if (app().specs[dbName].type == "dm8") msg = toUtf8FromGbk(msg);
+    return mcp::Err(McpErrorCode::InvalidParams, "count failed: " + msg);
   }
-  return mcp::Ok(toolResult(toMcpJson(rs)));
+  // dm8 reports aggregate values as strings; normalize `total` to a number so
+  // clients can compare it without per-dialect special cases (D-12).
+  Json out = toMcpJson(rs);
+  const Json data = member(out, "data");
+  if (data.isArray() && data.size() > 0) {
+    Json arr = Json("[]");
+    for (const auto& row : data.toVector()) {
+      Json normalized = row;
+      const Json total = member(normalized, "total");
+      if (total.isString()) {
+        try {
+          ZJSON::setChild(normalized, "total",
+                          Json(std::stoll(total.toString())));
+        } catch (...) {
+        }
+      }
+      arr.push_back(std::move(normalized));
+    }
+    ZJSON::setChild(out, "data", arr);
+  }
+  return mcp::Ok(toolResult(out));
 }
 
 McpResult<Json> toolInsert(Ctx& c) { return stageWrite(c, "insert"); }
@@ -641,7 +1071,7 @@ McpResult<Json> toolDelete(Ctx& c) { return stageWrite(c, "delete"); }
 // ---- registration -------------------------------------------------------------------
 
 void registerDataTools(mcp::server::Builder& b) {
-  b.tool(Json(R"({"name":"db_query","description":"PREFERRED data query - structured JSON, no SQL, same semantics on every backend. Supports: fields (projection), lks (fuzzy, % wildcards), ins (IN-list), ors (OR), group+sum (aggregation), sort, page/size (pagination), plus plain column conditions: {\"price\":100} equals, {\"price\":\">,100\"} compares (prefixes >, >=, <, <=, <>, =). Use db_query_sql only when JOINs or dialect functions are unavoidable.","inputSchema":{"type":"object","required":["db","table"],"properties":{"db":{"type":"string","description":"backend name"},"table":{"type":"string"},"fields":{"type":"array","items":{"type":"string"},"description":"column projection"},"lks":{"type":"object","description":"fuzzy matches, % wildcards, e.g. {\"name\":\"%abc%\"}"},"ins":{"type":"object","description":"IN-list matches"},"ors":{"type":"object","description":"OR conditions"},"group":{"type":"array","items":{"type":"string"},"description":"GROUP BY columns"},"sum":{"oneOf":[{"type":"object","additionalProperties":{"type":"string"}},{"type":"array","items":{"type":"string"}}],"description":"SUM aggregates, e.g. {\"amount\":\"total\"} or [\"amount\"]"},"count":{"type":"string","description":"COUNT column alias pair"},"sort":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}],"description":"ORDER BY"},"page":{"type":"integer","minimum":1},"size":{"type":"integer","minimum":1,"maximum":500}},"additionalProperties":{"description":"plain column condition: value equals, or \">,100\"-style compare prefix"}}})"),
+  b.tool(Json(R"({"name":"db_query","description":"PREFERRED data query - structured JSON, no SQL, same semantics on every backend. Supports: fields (projection), lks (fuzzy, % wildcards), ins (IN-list), ors (OR), group+sum (aggregation), sort, page/size (pagination), plus plain column conditions: {\"price\":100} equals, {\"price\":\">,100\"} compares (prefixes >, >=, <, <=, <>, =). Use db_query_sql only when JOINs or dialect functions are unavoidable.","inputSchema":{"type":"object","required":["db","table"],"properties":{"db":{"type":"string","description":"backend name"},"table":{"type":"string"},"fields":{"type":"array","items":{"type":"string"},"description":"column projection"},"lks":{"type":"object","description":"fuzzy matches, % wildcards, e.g. {\"name\":\"%abc%\"}"},"ins":{"type":"object","description":"IN-list matches; an array value means multiple values for that column, e.g. {\"age\":[18,20]}"},"ors":{"type":"object","description":"OR conditions"},"group":{"type":"array","items":{"type":"string"},"description":"GROUP BY columns"},"sum":{"oneOf":[{"type":"object","additionalProperties":{"type":"string"}},{"type":"array","items":{"type":"string"}},{"type":"string"}],"description":"SUM aggregate(s): {col:alias}, [col], or \"col,alias\""},"count":{"oneOf":[{"type":"object","additionalProperties":{"type":"string"}},{"type":"array","items":{"type":"string"}},{"type":"string"}],"description":"COUNT aggregate(s): {col:alias}, [col], or \"col,alias\""},"sort":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}],"description":"ORDER BY: array or \"col [asc|desc], col2\""},"page":{"type":"integer","minimum":1,"description":"1-based page; pair with size - size alone defaults to page 1."},"size":{"type":"integer","minimum":1,"maximum":500,"description":"rows per page (1..500); may be used alone"}},"additionalProperties":{"description":"plain column condition: value equals, or \">,100\"-style compare prefix"}}})"),
          toolQuery);
   b.tool(Json(R"({"name":"db_count","description":"Count rows in a table (optionally matching a where object whose keys are column conditions). Cheaper and clearer than db_query when only the number matters.","inputSchema":{"type":"object","required":["db","table"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"where":{"type":"object","description":"column conditions, e.g. {\"status\":\"paid\"}"}}}})"),
          toolCount);

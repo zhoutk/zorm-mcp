@@ -54,8 +54,27 @@ mcp::Json rowVal(const mcp::Json& row, std::initializer_list<const char*> keys);
 std::string rowStr(const mcp::Json& row, std::initializer_list<const char*> keys);
 
 // A conservative SQL identifier: letters/digits/underscore, not starting with
-// a digit. Metadata SQL and the delete-all execSql fallback inline table names
-// ONLY after this check (values are parameterized everywhere else).
+// a digit. Metadata SQL and every structured identifier that zorm inlines
+// (table/column/alias/sort) pass through this check - zorm's default
+// quoteIdent() is a no-op on sqlite/mysql/postgres, so validation is the
+// security boundary.
 bool validIdentifier(const std::string& name);
+
+// Comma-separated identifier list ("a,b,c"); true when every item is a valid
+// identifier (empty list is false).
+bool validIdentifierList(const std::string& csv);
+
+// "col [asc|desc][, col2 [asc|desc]...]" - the only sort grammar the smart
+// query supports. Rejects anything that could inject SQL.
+bool validSortClause(const std::string& spec);
+
+// Rewrites PostgreSQL `?` placeholders to $1..$n outside string literals,
+// quoted identifiers, comments and dollar-quoted blocks. Returns the number of
+// replacements made. Existing $n placeholders are left untouched.
+std::size_t rewritePgPlaceholders(std::string& sql);
+
+// Decodes a dm8 driver message (GBK on Windows) to UTF-8. Returns the input
+// unchanged when it is already valid UTF-8 or when transcoding is unavailable.
+std::string toUtf8FromGbk(const std::string& text);
 
 }  // namespace zorm_mcp

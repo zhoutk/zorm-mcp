@@ -28,6 +28,7 @@
 #include <random>
 #include <string>
 #include <thread>
+#include <tuple>
 #include <vector>
 
 using namespace mcp;
@@ -725,6 +726,123 @@ TEST(ZormMcpE2E, ValidationAndWriteFailurePaths) {
   EXPECT_NE(failed.error().message.find("[file:"), std::string::npos);
 }
 
+// ---- regressions from docs/TEST_REPORT.md ----------------------------------------
+
+TEST(ZormMcpE2E, ReportedDefectRegressions) {
+  Child child = spawnChild(false, true);  // --yes --allow-sql
+  PipeTransport t(child);
+  Client client("e2e", "1.0");
+  client.connect(t);
+  ASSERT_NO_FATAL_FAILURE(resetTable(client));
+
+  for (const char* id : {"r1", "r2", "r3"}) {
+    Json ins = argsWith("sqlite3");
+    ins.add("table", Json::str("t_e2e"));
+    ins.add("data", Json(std::string(R"({"id":")") + id +
+                         R"(","name":"n","score":10})"));
+    ASSERT_TRUE(client.callTool("db_insert", ins).has_value());
+  }
+
+  // D-03: ins:{col:[v1,v2]} means ONE column with N values.
+  auto insArr = client.callTool(
+      "db_query", Json(R"({"db":"sqlite3","table":"t_e2e","ins":{"id":["r1","r2"]}})"));
+  ASSERT_TRUE(insArr.has_value()) << insArr.error().message;
+  EXPECT_EQ(member(*insArr, "data").size(), 2u) << insArr->toString();
+
+  // D-05: string aggregate specs are "col,alias" (not doubled).
+  auto cntAlias = client.callTool(
+      "db_query", Json(R"({"db":"sqlite3","table":"t_e2e","count":"*,total"})"));
+  ASSERT_TRUE(cntAlias.has_value()) << cntAlias.error().message;
+  EXPECT_EQ((*cntAlias)["data"][0]["total"].toInt64(), 3);
+  auto sumAlias = client.callTool(
+      "db_query", Json(R"({"db":"sqlite3","table":"t_e2e","sum":"score,total"})"));
+  ASSERT_TRUE(sumAlias.has_value()) << sumAlias.error().message;
+  EXPECT_TRUE((*sumAlias)["data"][0]["total"].isNumber()) << sumAlias->toString();
+
+  // D-10: size alone paginates; page alone is rejected.
+  auto sizeOnly = client.callTool(
+      "db_query", Json(R"({"db":"sqlite3","table":"t_e2e","size":2})"));
+  ASSERT_TRUE(sizeOnly.has_value()) << sizeOnly.error().message;
+  EXPECT_EQ(member(*sizeOnly, "data").size(), 2u);
+  EXPECT_EQ((*sizeOnly)["records"].toInt64(), 3);
+  auto pageOnly = client.callTool(
+      "db_query", Json(R"({"db":"sqlite3","table":"t_e2e","page":2})"));
+  ASSERT_FALSE(pageOnly.has_value());
+  EXPECT_NE(pageOnly.error().message.find("page requires size"), std::string::npos);
+
+  // D-11: leading comments are allowed; the keyword after them still gates.
+  auto commented = client.callTool(
+      "db_query_sql", Json(R"({"db":"sqlite3","sql":"/* c */ select 1 as x"})"));
+  EXPECT_TRUE(commented.has_value()) << commented.error().message;
+  auto hiddenWrite = client.callTool(
+      "db_query_sql", Json(R"({"db":"sqlite3","sql":"-- c\n delete from t_e2e"})"));
+  ASSERT_FALSE(hiddenWrite.has_value());
+
+  // D-02: every structured identifier is validated before any SQL is built.
+  auto badTable = client.callTool(
+      "db_query",
+      Json(R"({"db":"sqlite3","table":"t_e2e where 1=1 --"})"));
+  ASSERT_FALSE(badTable.has_value());
+  EXPECT_NE(badTable.error().message.find("invalid table name"), std::string::npos);
+  auto badField = client.callTool(
+      "db_query",
+      Json(R"({"db":"sqlite3","table":"t_e2e","fields":["id from t_e2e --"]})"));
+  ASSERT_FALSE(badField.has_value());
+  EXPECT_NE(badField.error().message.find("invalid field name"), std::string::npos);
+  auto badSort = client.callTool(
+      "db_query",
+      Json(R"({"db":"sqlite3","table":"t_e2e","sort":["score desc; drop table t_e2e"]})"));
+  ASSERT_FALSE(badSort.has_value());
+  EXPECT_NE(badSort.error().message.find("invalid sort"), std::string::npos);
+  auto badCondition = client.callTool(
+      "db_query",
+      Json(R"({"db":"sqlite3","table":"t_e2e","id = 1 or 1":"x"})"));
+  ASSERT_FALSE(badCondition.has_value());
+  EXPECT_NE(badCondition.error().message.find("invalid condition column name"),
+            std::string::npos);
+  auto badColumn = client.callTool(
+      "db_insert",
+      Json(R"({"db":"sqlite3","table":"t_e2e","data":{"id;drop":"x"}})"));
+  ASSERT_FALSE(badColumn.has_value());
+  EXPECT_NE(badColumn.error().message.find("invalid column name"), std::string::npos);
+  auto badTrans = client.callTool(
+      "db_trans",
+      Json(R"({"db":"sqlite3","sqls":[{"table":"t_e2e where 1=1 --","method":"delete","params":{}}]})"));
+  ASSERT_FALSE(badTrans.has_value());
+  EXPECT_NE(badTrans.error().message.find("invalid transaction table name"),
+            std::string::npos);
+
+  // Nothing was executed by the rejected payloads.
+  auto cnt = client.callTool(
+      "db_count", Json(R"({"db":"sqlite3","table":"t_e2e"})"));
+  ASSERT_TRUE(cnt.has_value());
+  EXPECT_EQ((*cnt)["data"][0]["total"].toInt64(), 3);
+
+  // db_exec_sql now binds `values` (previously ignored) and reports both
+  // affected/affectedRows (D-12).
+  Json exec = argsWith("sqlite3");
+  exec.add("sql", Json::str(
+      "insert into t_e2e (id, name, score) values (?, ?, ?)"));
+  exec.add("values", Json(R"(["r4","dave",40])"));
+  auto execRs = client.callTool("db_exec_sql", exec);
+  ASSERT_TRUE(execRs.has_value()) << execRs.error().message;
+  EXPECT_TRUE((*execRs)["affected"].isNumber());
+  EXPECT_TRUE((*execRs)["affectedRows"].isNumber());
+  EXPECT_EQ(countOf(client, "sqlite3", "t_e2e"), 4);
+
+  // D-01: the default jsonfile data file is zorm-mcp-data.json, never the
+  // zorm-mcp.json config template.
+  const char* tb = "e2e_default_json";
+  ASSERT_NO_FATAL_FAILURE(clearJsonTable(client, tb));
+  Json ji = argsWith("jsonfile");
+  ji.add("table", Json::str(tb));
+  ji.add("data", Json(R"({"note":"default-file"})"));
+  ASSERT_TRUE(client.callTool("db_insert", ji).has_value());
+  // The child inherits this process's cwd, so the default file lands here.
+  EXPECT_TRUE(std::filesystem::exists(
+      std::filesystem::current_path() / "zorm-mcp-data.json"));
+}
+
 // ---- the open-box jsonfile backend (same semantics, no SQL) ----------------------
 
 TEST(ZormMcpE2E, JsonfileParity) {
@@ -940,7 +1058,7 @@ TEST(ZormMcpE2E, MrtrWriteConfirmation) {
 // ---- protocol eras, capabilities, negotiation hints -------------------------------
 
 TEST(ZormMcpE2E, ModernDiscoverAdvertisesV04Surface) {
-  Child child = spawnChild(false, false, {"--log-level", "info"});
+  Child child = spawnChild(false, false);
   PipeTransport t(child);
   Client client("e2e", "1.0");
   client.connect(t);
@@ -1160,6 +1278,24 @@ TEST(ZormMcpE2E, ConfigFileAndCli) {
     EXPECT_NE(missing.error().message.find("cfgdb"), std::string::npos);
   }
 
+  // D-01: refuse to open a zorm-mcp CONFIG file as the jsonfile database.
+  const fs::path configAsData = dir / "config-as-data.json";
+  {
+    std::ofstream out(configAsData, std::ios::binary);
+    out << R"({"databases":{"x":{"type":"sqlite3","options":{}}}})";
+  }
+  const fs::path clashCfg = dir / "clash.json";
+  {
+    std::ofstream out(clashCfg, std::ios::binary);
+    out << R"({"databases":{"j":{"type":"jsonfile","options":{)"
+        << R"("connString":")" << configAsData.generic_string()
+        << R"(","DbLogClose":true}}}})";
+  }
+  {
+    Child child = spawnChild(false, false, {"--config", clashCfg.generic_string()});
+    EXPECT_EQ(child.waitExit(), 1);
+  }
+
   // Malformed config -> exit code 2 (usage/config error), no server loop.
   const fs::path badCfg = dir / "bad.json";
   {
@@ -1202,6 +1338,155 @@ TEST(ZormMcpE2E, ConfigFileAndCli) {
 #endif
 
   fs::remove_all(dir);
+}
+
+// ---- optional remote dialect matrix -------------------------------------------------
+//
+// Opt-in (CI stays offline): set ZORM_MCP_REMOTE_CONFIG to a zorm-mcp config
+// file containing mysql / postgres / dm8 entries, e.g.
+//   set ZORM_MCP_REMOTE_CONFIG=D:\codes\zorm-mcp\.tmp-remote.json
+// The test creates a scratch table per backend, verifies the dialect fixes,
+// and drops it afterwards.
+TEST(ZormMcpE2E, RemoteBackendsMatrix) {
+  const char* cfgPath = std::getenv("ZORM_MCP_REMOTE_CONFIG");
+  if (cfgPath == nullptr || *cfgPath == '\0') {
+    GTEST_SKIP() << "set ZORM_MCP_REMOTE_CONFIG to run the remote matrix";
+  }
+  std::ifstream in(cfgPath, std::ios::binary);
+  ASSERT_TRUE(in) << "cannot read " << cfgPath;
+  std::string raw((std::istreambuf_iterator<char>(in)),
+                  std::istreambuf_iterator<char>());
+  std::string err;
+  const Json cfg = Json::ParseJson(raw, err);
+  ASSERT_FALSE(cfg.isError()) << err;
+  const Json dbs = member(cfg, "databases");
+  ASSERT_TRUE(dbs.isObject()) << cfgPath;
+
+  Child child = spawnChild(false, true, {"--config", cfgPath});
+  PipeTransport t(child);
+  Client client("e2e-remote", "1.0");
+  client.connect(t);
+
+  for (const char* backend : {"mysql", "postgres", "dm8"}) {
+    const std::string db = backend;
+    const Json spec = member(dbs, db);
+    if (!spec.isObject()) continue;  // not configured
+    auto info = client.callTool("db_info", Json(std::string(R"({"db":")") + db + R"("})"));
+    if (!info.has_value()) {
+      EXPECT_NE(info.error().message.find("unknown db"), std::string::npos)
+          << backend << ": " << info.error().message;
+      continue;
+    }
+
+    const bool isMysql = db == "mysql";
+    const bool isPg = db == "postgres";
+    const char* q = isMysql ? "`" : "\"";
+    std::string schema;
+    const Json opts = member(spec, "options");
+    if (db == "dm8" && ZJSON::hasChild(opts, "db_name"))
+      schema = opts["db_name"].toString();
+    const std::string tableName = "mcp_fix_test";
+    const std::string qualified =
+        db == "dm8" && !schema.empty() && schema != "null"
+            ? std::string("\"") + schema + "\"." + q + tableName + q
+            : std::string(q) + tableName + q;
+    const std::string kind = isPg ? "double precision" : "double";
+
+    auto exec = [&](const std::string& sql) {
+      Json a = argsWith(db.c_str());
+      a.add("sql", Json::str(sql));
+      return client.callTool("db_exec_sql", a);
+    };
+    (void)exec("drop table if exists " + qualified);
+    auto created = exec("create table " + qualified + " (" + q + "id" + q +
+                        " varchar(32) primary key, " + q + "name" + q +
+                        " varchar(32), " + q + "age" + q + " integer, " + q +
+                        "score" + q + " " + kind + ")");
+    ASSERT_TRUE(created.has_value()) << backend << ": " << created.error().message;
+
+    Json rows = Json(R"([])");
+    for (const auto& [id, name, age] :
+         {std::tuple<const char*, const char*, int>{"a", "ada", 18},
+          {"b", "bob", 20}, {"c", "carol", 30}}) {
+      Json row;
+      row.add("id", Json::str(id));
+      row.add("name", Json::str(name));
+      row.add("age", Json(age));
+      row.add("score", Json(10));
+      rows.push_back(row);
+    }
+    Json batch = argsWith(db.c_str());
+    batch.add("table", Json::str(tableName));
+    batch.add("rows", rows);
+    auto seeded = client.callTool("db_insert_batch", batch);
+    ASSERT_TRUE(seeded.has_value()) << backend << ": " << seeded.error().message;
+
+    // D-03: one column, multiple values.
+    Json qins = argsWith(db.c_str());
+    qins.add("table", Json::str(tableName));
+    qins.add("ins", Json(R"({"age":[18,20]})"));
+    auto ins = client.callTool("db_query", qins);
+    ASSERT_TRUE(ins.has_value()) << backend << ": " << ins.error().message;
+    EXPECT_EQ(member(*ins, "data").size(), 2u) << backend;
+
+    // D-05: alias forms.
+    Json qcount = argsWith(db.c_str());
+    qcount.add("table", Json::str(tableName));
+    qcount.add("count", Json::str("*,total"));
+    auto cnt = client.callTool("db_query", qcount);
+    ASSERT_TRUE(cnt.has_value()) << backend << ": " << cnt.error().message;
+    EXPECT_TRUE((*cnt)["data"][0]["total"].isNumber()) << backend;
+    EXPECT_EQ((*cnt)["data"][0]["total"].toInt64(), 3) << backend;
+
+    // D-02: structured identifier injections are rejected, rows stay intact.
+    Json inject = argsWith(db.c_str());
+    inject.add("table", Json::str(tableName + " where 1=1 --"));
+    auto inj = client.callTool("db_query", inject);
+    ASSERT_FALSE(inj.has_value()) << backend;
+    EXPECT_NE(inj.error().message.find("invalid table name"), std::string::npos);
+
+    // D-10: size alone paginates.
+    Json qpage = argsWith(db.c_str());
+    qpage.add("table", Json::str(tableName));
+    qpage.add("size", Json(2));
+    auto page = client.callTool("db_query", qpage);
+    ASSERT_TRUE(page.has_value()) << backend << ": " << page.error().message;
+    EXPECT_EQ(member(*page, "data").size(), 2u) << backend;
+    EXPECT_EQ((*page)["records"].toInt64(), 3) << backend;
+
+    // D-07 (pg) / D-08 (mysql) / D-06 (dm8).
+    if (isPg) {
+      Json sql = argsWith(db.c_str());
+      sql.add("sql", Json::str(
+          std::string("select name from ") + qualified + " where age = ?"));
+      sql.add("values", Json(R"([20])"));
+      auto r = client.callTool("db_query_sql", sql);
+      ASSERT_TRUE(r.has_value()) << r.error().message;
+      EXPECT_EQ((*r)["data"][0]["name"].toString(), "bob");
+    }
+    if (isMysql) {
+      Json sql = argsWith(db.c_str());
+      sql.add("sql", Json::str("explain select * from " + qualified));
+      auto r = client.callTool("db_query_sql", sql);
+      ASSERT_TRUE(r.has_value()) << r.error().message;
+      EXPECT_GT((*r)["data"].size(), 0u);
+    }
+    if (db == "dm8") {
+      Json del = argsWith(db.c_str());
+      del.add("table", Json::str(tableName));
+      del.add("where", Json("{}"));
+      auto r = client.callTool("db_delete", del);
+      ASSERT_TRUE(r.has_value()) << r.error().message;
+      auto after = client.callTool(
+          "db_count", Json(std::string(R"({"db":"dm8","table":")") +
+                           tableName + R"("})"));
+      ASSERT_TRUE(after.has_value()) << after.error().message;
+      EXPECT_EQ((*after)["data"][0]["total"].toInt64(), 0);
+    }
+
+    auto dropped = exec("drop table if exists " + qualified);
+    EXPECT_TRUE(dropped.has_value()) << backend;
+  }
 }
 
 // ---- HTTP transport: authentication, principal-bound MRTR --------------------------

@@ -511,6 +511,72 @@ gantt
 
 ---
 
+## 8. 修订实施计划（2026-10-22，逐项核对代码后）
+
+### 8.1 复核结论与计划调整
+
+| 编号 | 复核结果 | 计划调整 |
+| --- | --- | --- |
+| D-01 | 确认。默认 `jsonfile` 的 `connString` 与配置模板同名，`jsonfileTables()` 把配置对象当空库，写入时触发 zorm 的 corrupt 备份 | 默认库改名 `zorm-mcp-data.json`；启动时识别"配置文件当库"并拒绝；`.gitignore` 加 `*.corrupt.*` |
+| D-02 | 确认且**范围比报告更大**：zorm 的 `quoteIdent()` 在 sqlite/mysql/pg 上是原样返回，除 `table` 外，`fields`/`group`/`sort`/`lks`/`ins`/`ors`/`sum`/`count`/where 键/`data` 键/批量 `constraint`/事务结构化元素都可注入 | 统一入口校验**表名 + 所有结构化标识符**；非法即 `InvalidParams`；新增注入载荷回归用例 |
+| D-03 | 确认。数组分支对每个元素重复列名 | `ins` 数组改为 `col,v1,v2,...`；`lks`/`ors` 保持成对 |
+| D-04 | 确认。MySQL 驱动返回大写 `IS_NULLABLE`/`COLUMN_DEFAULT` | 候选键补大写（含 `IS_NULLABLE`） |
+| D-05 | 确认。字符串分支做了 `s+","+s`，数组分支别名只能用列名 | 字符串原样透传；数组元素 `col,col`（元素本身含逗号则透传）；`count` schema 与 `sum` 对齐 |
+| D-06 | 确认。delete-all 直接 `delete from <table>`，未走 dm8 的 `"schema"."table"` | dm8 用 `db_name` 拼限定名，其余后端保持原样 |
+| D-07 | 确认。pg 只认 `$n`；`detectParameterized()` 只看 `?` | 服务端做 `?`→`$n` 归一化（跳过字符串/注释/dollar-quote），`db_query_sql` 与 `db_trans` 文本元素统一；数量与 `values` 不符时给定向报错 |
+| D-08 | 确认，根因在 **zorm** `MysqlDb::execStmtQuery`：`mysql_stmt_result_metadata()` 在 `mysql_stmt_execute()` 之前调用；`parameterized:false` 路径正常 | 在 `thirds/zorm` 调整为先 execute 再取 metadata，并跑 `./run-test all`；更新子模块指针 |
+| D-09 | 确认。dm8 `user_tables` 未过滤，系统表含 `#` | `listTables()` 统一用 `validIdentifier` 过滤，保证列表与 `describe_table` 可描述集合一致 |
+| D-10 | 确认。zorm 仅 `page>0` 时才分页；`size` 单独传无效，`page` 单独传 `limit 0,0` | handler 归一化：只传 `size` → `page=1`；只传 `page` → 明确报错要求同时提供；校验 `1..500` |
+| D-11 | 确认。只跳过空白 | 扫描前导 `--` / `/* */` 注释；仍拒绝多语句 |
+| D-12 | 确认。`[file:]` 无条件追加；dm8 字段命名/类型/编码不一致 | 本轮做：`affected`/`affectedRows` 归一、`[file:]` 仅在 connString 非空时输出、db_count 的 `total` 数值化；dm8 GBK 转 UTF-8；批量结果的 `insertId` 保留但文档说明 |
+| O-01 | 服务端 40 次并发未复现 | 不改服务端；FAQ 写明"同批并行混合读写"风险与串行建议；新增 20 条流水线只读查询基线用例 |
+| O-02 | 已可用：arguments 层 `inputResponses`（不带 state）会回退到该 `(db,table,kind)` 最近 pending | 写入 `INTEGRATION.md`、`db://guide` 与 playbook，明确降级批准方式 |
+
+### 8.2 实施顺序（本轮一次完成）
+
+| 批次 | 内容 | 验收 |
+| --- | --- | --- |
+| A | 标识符校验框架 + D-02 全部入口；D-01 默认库/配置识别；`.gitignore` | 4 个注入载荷 + 列名/排序/聚合注入全部拒绝；默认 jsonfile 可建表且无 `.corrupt.*` |
+| B | D-03/D-04/D-05/D-06/D-09/D-10/D-11 | 新增 e2e 用例全绿；三远端后端矩阵手工复核 |
+| C | D-07 占位符归一化 + D-08 zorm MySQL 修复 + D-12 信封收口 | pg `?` SQL 四后端同结果；mysql `explain` 成功；dm8 删除/计数/错误文本可读 |
+| D | 测试与文档 | `ctest` 全绿；README/INTEGRATION/guide/playbook/dialects 更新；`thirds/zorm` 指针同步 |
+
+### 8.3 明确的非目标
+
+- 不修改 `thirds/mcp-cpp`（协议层行为正确）。
+- 不把 `db_query_sql` / `db_exec_sql` / `db_trans` 的**原始 SQL 文本**纳入标识符校验——它们本来就是显式逃生口；只校验结构化字段。
+- 不承诺列名含空格/连字符/引号的表；结构化工具接受的是简单标识符（字母/数字/下划线，非数字开头），复杂对象名请用 `db_query_sql`。
+
+### 8.4 实施结果（2026-10-22）
+
+| 编号 | 状态 | 实施位置 |
+| --- | --- | --- |
+| D-01 | ✅ | `app.cpp` 默认 `zorm-mcp-data.json`；启动时拒绝配置形状的 jsonfile；`.gitignore` 加 `*.corrupt.*` |
+| D-02 | ✅ | `data_tools.cpp` 的 `checkWriteArgs` / `checkQueryArgs` / `checkTransElements`；表/列/排序/聚合/事务标识符统一校验 |
+| D-03 | ✅ | `convertPairsObject(..., sameKeyForArray)`：`ins` 数组 → `col,v1,v2` |
+| D-04 | ✅ | `app.cpp` nullable/default 候选键补 `IS_NULLABLE` / `COLUMN_DEFAULT` |
+| D-05 | ✅ | `data_tools.cpp` sum/count 字符串透传、单列补别名；schema 放开 string/object/array |
+| D-06 | ✅ | dm8 delete-all 使用 `"schema"."table"` |
+| D-07 | ✅ | `json_util.cpp` `rewritePgPlaceholders`；`db_query_sql` / `db_exec_sql` / `db_trans` 文本统一 |
+| D-08 | ✅ | `thirds/zorm` `MysqlDb::execStmtQuery`：先 execute 再取结果元数据 |
+| D-09 | ✅ | `listTables` 统一过滤 `validIdentifier`；dm8 目录改查 `all_*` + `owner = db_name` |
+| D-10 | ✅ | `toolQuery` 归一化：size-only → page 1；page-only 报错；1..500 校验 |
+| D-11 | ✅ | `checkReadOnlySql` 跳过前导 `--` / `/* */` 注释 |
+| D-12 | ✅（部分） | `affected`/`affectedRows` 互补、批量去 `insertId`、`[file:]` 仅文件后端、dm8 GBK→UTF-8、count/sum 别名数值化 |
+| O-01 | ✅ 文档 | README/FAQ 建议串行；服务端不改 |
+| O-02 | ✅ 文档 | README/INTEGRATION/guide 增补降级批准通道 |
+
+**验证结果**
+
+- 本地：`ctest --test-dir build` → 3/3 套件通过（e2e 含新增 `ReportedDefectRegressions`、HTTPS、协议双时代等）。
+- 远端矩阵：自建协议脚本对 sqlite3 / mysql / postgres / dm8 执行 **73/73** 项检查全部通过（`docs/TEST_REPORT.md` §3 的缺陷路径逐项复跑）。
+- `thirds/zorm`：`./run-test all` → **13/13** 通过（含 mysql/pg/dm8 契约与 plain 变体）。
+- 新增可选自动化：`ZORM_MCP_REMOTE_CONFIG=<config> mcp_test_zorm_mcp --gtest_filter=ZormMcpE2E.RemoteBackendsMatrix`（默认 skip，CI 无需远端）。
+
+**仍保留的已知限制**：pair 编码值不能含逗号；jsonfile 的 `%` 通配为近似；`db_trans` 原始文本仍是显式逃生口。详见 `docs/dialects.md`。
+
+---
+
 ## 附录 A：复现命令速查
 
 ```bash
