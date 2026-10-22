@@ -392,6 +392,50 @@ TEST(ZormMcpE2E, DiscoverToolsListAndGating) {
   EXPECT_NE((*overview).toString().find("jsonfile"), std::string::npos);
 }
 
+// Strict clients (VS Code / Copilot) reject a tool schema whose array type has
+// no `items`. Walk every schema node and assert the invariant holds after the
+// db_query_sql/db_exec_sql `values` regression.
+static void checkArraySchemas(const Json& node, const std::string& path,
+                              std::vector<std::string>& problems) {
+  if (node.isArray()) {
+    const auto items = node.toVector();
+    for (size_t i = 0; i < items.size(); ++i)
+      checkArraySchemas(items[i], path + "[" + std::to_string(i) + "]", problems);
+    return;
+  }
+  if (!node.isObject()) return;
+  if (member(node, "type").toString() == "array" && !node.contains("items")) {
+    problems.push_back(path + ": array without items");
+  }
+  for (const auto& k : node.getAllKeys().toVector()) {
+    const std::string key = k.toString();
+    checkArraySchemas(node[key], path + "/" + key, problems);
+  }
+}
+
+TEST(ZormMcpE2E, ToolSchemasSatisfyStrictArrayValidation) {
+  Child child = spawnChild(false, true);  // --allow-sql: include db_exec_sql
+  PipeTransport t(child);
+  Client client("e2e", "1.0");
+  client.connect(t);
+
+  auto tools = client.listTools();
+  ASSERT_TRUE(tools.has_value()) << tools.error().message;
+  const Json arr = member(*tools, "tools");
+  ASSERT_TRUE(arr.isArray());
+  std::vector<std::string> problems;
+  for (const auto& tool : arr.toVector()) {
+    const std::string name = member(tool, "name").toString();
+    checkArraySchemas(member(tool, "inputSchema"), name, problems);
+  }
+  EXPECT_TRUE(problems.empty());
+  for (const auto& p : problems) ADD_FAILURE() << p;
+
+  // The specific shape Copilot flagged.
+  EXPECT_NE(tools->toString().find("\"values\":{\"type\":\"array\",\"items\":{}"),
+            std::string::npos);
+}
+
 // ---- metadata: the "get table fields" capability ---------------------------------
 
 TEST(ZormMcpE2E, MetadataOnEmptyTable) {

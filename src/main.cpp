@@ -92,7 +92,7 @@ std::shared_ptr<Server> buildServer(const std::string& logLevel) {
   zorm_mcp::registerSqlTools(b);
   if (g.allowSql) {
     // Raw write/DDL SQL: operator opt-in, MRTR-confirmed when enabled.
-    b.tool(Json(R"({"name":"db_exec_sql","description":"Execute ARBITRARY write/DDL SQL (INSERT/UPDATE/DELETE/CREATE/...), MRTR-confirmed. Use only for what the structured tools cannot express (schema changes, bulk conditional ops). Prefer db_query_sql for reads and db_trans for atomic batches. Bind values via values array (? placeholders) rather than concatenating them into sql.","inputSchema":{"type":"object","required":["db","sql"],"properties":{"db":{"type":"string","description":"backend name"},"sql":{"type":"string"},"values":{"type":"array","description":"positional bindings for ? placeholders"}}}})"),
+    b.tool(Json(R"({"name":"db_exec_sql","description":"Execute ARBITRARY write/DDL SQL (INSERT/UPDATE/DELETE/CREATE/...), MRTR-confirmed. Use only for what the structured tools cannot express (schema changes, bulk conditional ops). Prefer db_query_sql for reads and db_trans for atomic batches. Bind values via values array (? placeholders) rather than concatenating them into sql.","inputSchema":{"type":"object","required":["db","sql"],"properties":{"db":{"type":"string","description":"backend name"},"sql":{"type":"string"},"values":{"type":"array","items":{},"description":"positional bindings for ? placeholders"}}}})"),
            [](Ctx& c) { return zorm_mcp::stageWrite(c, "exec_sql"); });
   }
   zorm_mcp::registerResourcesAndCompletion(b);
