@@ -108,22 +108,50 @@ McpResult<Json> resourceSchema(Ctx& c) {
 // ---- completion -----------------------------------------------------------------
 
 McpResult<Json> toolCompletion(Ctx& c) {
-  // params: {ref: {type, name, arguments?...}, argument: {name, value}}
+  // params: {ref: {type, name?, uri?, arguments?...}, argument: {name, value}}
+  //
+  // The MCP spec's `ref` for a resource template carries `uri` (e.g.
+  // "db://schema/{db}") and NO `name`; prompt refs carry `name`. The argument
+  // being completed always comes from `argument.name`. The old code read only
+  // ref.name, so a spec-shaped client got {"values":[]} - an empty completion.
   const Json ref = member(c.params, "ref");
-  const std::string argName = ref["name"].toString();
   const Json argument = member(c.params, "argument");
-  const std::string partial = argument["value"].toString();
+  const Json refArgs = member(ref, "arguments");
+  auto asString = [](const Json& j) {
+    return j.isString() ? j.toString() : std::string();
+  };
+  const std::string uri = asString(member(ref, "uri"));
+  const std::string partial = asString(member(argument, "value"));
+
+  std::string argName = asString(member(argument, "name"));
+  if (argName.empty()) argName = asString(member(ref, "name"));
+  if (argName.empty()) {
+    // Derive it from the URI template when the client omits both.
+    if (uri.find("{table}") != std::string::npos)
+      argName = "table";
+    else if (uri.find("{db}") != std::string::npos)
+      argName = "db";
+  }
+
+  // db from ref.arguments, else from a partially-resolved template path
+  // ("db://schema/{db}" has no concrete db, but "db://schema/sqlite3/{table}"
+  // does).
+  std::string dbName = asString(member(refArgs, "db"));
+  if (dbName.empty() && uri.rfind("db://schema/", 0) == 0) {
+    std::string seg = uri.substr(std::string("db://schema/").size());
+    const size_t slash = seg.find('/');
+    if (slash != std::string::npos) seg = seg.substr(0, slash);
+    if (!seg.empty() && seg[0] != '{' && app().db(seg) != nullptr) dbName = seg;
+  }
 
   Json result;
   Json values = Json("[]");
   if (argName == "db") {
-    for (const auto& [dbName, spec] : app().specs) {
-      if (partial.empty() || dbName.rfind(partial, 0) == 0)
-        values.push_back(Json::str(dbName));
+    for (const auto& [name, spec] : app().specs) {
+      if (partial.empty() || name.rfind(partial, 0) == 0)
+        values.push_back(Json::str(name));
     }
   } else if (argName == "table") {
-    // ref.arguments carries the already-chosen db (when the client sends it).
-    const std::string dbName = member(member(ref, "arguments"), "db").toString();
     std::vector<std::string> tables;
     if (app().db(dbName) != nullptr) {
       tables = listTables(dbName);
@@ -137,9 +165,7 @@ McpResult<Json> toolCompletion(Ctx& c) {
     }
   } else if (argName == "fields") {
     // fields is an array; argument.value is the entry being typed.
-    const Json refArgs = member(ref, "arguments");
-    const std::string dbName = refArgs["db"].toString();
-    const std::string table = refArgs["table"].toString();
+    const std::string table = asString(member(refArgs, "table"));
     for (const auto& col : describeTable(dbName, table)) {
       if (partial.empty() || col.name.rfind(partial, 0) == 0)
         values.push_back(Json::str(col.name));

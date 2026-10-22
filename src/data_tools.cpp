@@ -66,6 +66,14 @@ std::optional<std::string> badIdent(const std::string& what,
          "names belong in db_query_sql)";
 }
 
+// The one wording for "db_delete cannot express this WHERE", used both when
+// staging (reject early, never show a doomed confirmation) and when executing.
+const char* const kDeleteWhereHint =
+    "db_delete supports only where:{\"id\": <value>} (single row) or an empty "
+    "where:{} (delete ALL rows). For condition-based deletes stage them in "
+    "db_trans (structured delete elements), or query ids with db_query and "
+    "delete them one by one";
+
 std::optional<std::string> checkObjectKeys(const Json& obj,
                                            const std::string& what) {
   if (!obj.isObject()) return std::nullopt;
@@ -149,6 +157,34 @@ std::vector<std::string> aggregateAliases(const Json& args) {
   return aliases;
 }
 
+// lks/ins/ors travel to zorm as the pair string "col,val,col,val": a comma
+// INSIDE a value cannot be represented, and zorm's reply ("Param is wrong.
+// details, ors is wrong.") does not say why. Reject early with the fix.
+std::optional<std::string> checkPairValue(const std::string& key,
+                                          const std::string& value) {
+  if (value.find(',') == std::string::npos) return std::nullopt;
+  return key + " value \"" + value + "\" contains a comma. The " + key +
+         " pair encoding is \"col,value,col,value\", so commas cannot appear "
+         "inside a value (this includes compare prefixes like \">,35\"). Use "
+         "db_query_sql with an explicit WHERE instead, e.g. {\"sql\":\"select * "
+         "from t where price > 35\"}";
+}
+
+std::optional<std::string> checkPairValues(const Json& v,
+                                           const std::string& key) {
+  for (const auto& k : v.getAllKeys().toVector()) {
+    const Json vv = v[k.toString()];
+    if (vv.isString()) {
+      if (auto e = checkPairValue(key, vv.toString())) return e;
+    } else if (vv.isArray()) {
+      for (const auto& item : vv.toVector()) {
+        if (auto e = checkPairValue(key, item.toString())) return e;
+      }
+    }
+  }
+  return std::nullopt;
+}
+
 std::optional<std::string> checkSortSpec(const Json& v) {
   if (v.isString()) {
     if (!validSortClause(v.toString()))
@@ -211,6 +247,7 @@ std::optional<std::string> checkQueryArgs(const Json& args) {
     if (!v.isObject())
       return std::string(key) + " must be an object {column: value|values}";
     if (auto e = checkObjectKeys(v, std::string(key) + " column")) return e;
+    if (auto e = checkPairValues(v, key)) return e;
   }
   for (const char* key : {"sum", "count"}) {
     const Json v = member(args, key);
@@ -291,6 +328,12 @@ std::optional<std::string> checkWriteArgs(const std::string& kind,
     for (const auto& k : where.getAllKeys().toVector()) {
       if (auto e = badIdent("where column", k.toString())) return e;
     }
+    // Reject a non-id condition HERE, before staging. Staging first showed
+    // the user a confirmation (with a row-count estimate) for an operation
+    // that could only fail after they approved it.
+    const Json idv = member(where, "id");
+    const bool hasId = idv.isString() || idv.isNumber();
+    if (!hasId && !ZJSON::isEmptyObject(where)) return kDeleteWhereHint;
   }
   return std::nullopt;
 }
@@ -608,11 +651,7 @@ McpResult<Json> executeWrite(const std::string& dbName, const std::string& table
         rs = db->execSql("delete from " + target);
       }
     } else {
-      return mcp::Err(McpErrorCode::InvalidParams,
-                      "db_delete supports only where:{\"id\": <value>} (single row) "
-                      "or an empty where:{} (delete ALL rows). For condition-based "
-                      "deletes stage them in db_trans (structured delete elements), "
-                      "or query ids with db_query and delete them one by one");
+      return mcp::Err(McpErrorCode::InvalidParams, kDeleteWhereHint);
     }
   } else if (kind == "exec_sql") {
     std::string sql = member(args, "sql").toString();
@@ -1071,7 +1110,7 @@ McpResult<Json> toolDelete(Ctx& c) { return stageWrite(c, "delete"); }
 // ---- registration -------------------------------------------------------------------
 
 void registerDataTools(mcp::server::Builder& b) {
-  b.tool(Json(R"({"name":"db_query","description":"PREFERRED data query - structured JSON, no SQL, same semantics on every backend. Supports: fields (projection), lks (fuzzy, % wildcards), ins (IN-list), ors (OR), group+sum (aggregation), sort, page/size (pagination), plus plain column conditions: {\"price\":100} equals, {\"price\":\">,100\"} compares (prefixes >, >=, <, <=, <>, =). Use db_query_sql only when JOINs or dialect functions are unavoidable.","inputSchema":{"type":"object","required":["db","table"],"properties":{"db":{"type":"string","description":"backend name"},"table":{"type":"string"},"fields":{"type":"array","items":{"type":"string"},"description":"column projection"},"lks":{"type":"object","description":"fuzzy matches, % wildcards, e.g. {\"name\":\"%abc%\"}"},"ins":{"type":"object","description":"IN-list matches; an array value means multiple values for that column, e.g. {\"age\":[18,20]}"},"ors":{"type":"object","description":"OR conditions"},"group":{"type":"array","items":{"type":"string"},"description":"GROUP BY columns"},"sum":{"oneOf":[{"type":"object","additionalProperties":{"type":"string"}},{"type":"array","items":{"type":"string"}},{"type":"string"}],"description":"SUM aggregate(s): {col:alias}, [col], or \"col,alias\""},"count":{"oneOf":[{"type":"object","additionalProperties":{"type":"string"}},{"type":"array","items":{"type":"string"}},{"type":"string"}],"description":"COUNT aggregate(s): {col:alias}, [col], or \"col,alias\""},"sort":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}],"description":"ORDER BY: array or \"col [asc|desc], col2\""},"page":{"type":"integer","minimum":1,"description":"1-based page; pair with size - size alone defaults to page 1."},"size":{"type":"integer","minimum":1,"maximum":500,"description":"rows per page (1..500); may be used alone"}},"additionalProperties":{"description":"plain column condition: value equals, or \">,100\"-style compare prefix"}}})"),
+  b.tool(Json(R"({"name":"db_query","description":"PREFERRED data query - structured JSON, no SQL, same semantics on every backend. Supports: fields (projection), lks (fuzzy, % wildcards), ins (IN-list), ors (OR), group+sum (aggregation), sort, page/size (pagination), plus plain column conditions: {\"price\":100} equals, {\"price\":\">,100\"} compares (prefixes >, >=, <, <=, <>, =). Use db_query_sql only when JOINs or dialect functions are unavoidable.","inputSchema":{"type":"object","required":["db","table"],"properties":{"db":{"type":"string","description":"backend name"},"table":{"type":"string"},"fields":{"type":"array","items":{"type":"string"},"description":"column projection"},"lks":{"type":"object","description":"fuzzy matches, % wildcards, e.g. {\"name\":\"%abc%\"}; values cannot contain commas"},"ins":{"type":"object","description":"IN-list matches; an array value means multiple values for that column, e.g. {\"age\":[18,20]}; values cannot contain commas"},"ors":{"type":"object","description":"OR conditions; values cannot contain commas - use db_query_sql for compare-prefix values like \">,35\""},"group":{"type":"array","items":{"type":"string"},"description":"GROUP BY columns"},"sum":{"oneOf":[{"type":"object","additionalProperties":{"type":"string"}},{"type":"array","items":{"type":"string"}},{"type":"string"}],"description":"SUM aggregate(s): {col:alias}, [col], or \"col,alias\""},"count":{"oneOf":[{"type":"object","additionalProperties":{"type":"string"}},{"type":"array","items":{"type":"string"}},{"type":"string"}],"description":"COUNT aggregate(s): {col:alias}, [col], or \"col,alias\""},"sort":{"oneOf":[{"type":"array","items":{"type":"string"}},{"type":"string"}],"description":"ORDER BY: array or \"col [asc|desc], col2\""},"page":{"type":"integer","minimum":1,"description":"1-based page; pair with size - size alone defaults to page 1."},"size":{"type":"integer","minimum":1,"maximum":500,"description":"rows per page (1..500); may be used alone"}},"additionalProperties":{"description":"plain column condition: value equals, or \">,100\"-style compare prefix"}}})"),
          toolQuery);
   b.tool(Json(R"({"name":"db_count","description":"Count rows in a table (optionally matching a where object whose keys are column conditions). Cheaper and clearer than db_query when only the number matters.","inputSchema":{"type":"object","required":["db","table"],"properties":{"db":{"type":"string"},"table":{"type":"string"},"where":{"type":"object","description":"column conditions, e.g. {\"status\":\"paid\"}"}}}})"),
          toolCount);

@@ -57,6 +57,9 @@ zorm 的 dm8 方言用 `db_name` 作为 **schema** 限定名（`"dbtest"."table"
 
 ## 7. 已知限制
 
-- `db_query` 的 pair 编码（`lks/ins/ors`）假设值本身不含逗号；含逗号的值请用 `db_query_sql` 参数绑定。
+- `db_query` 的 pair 编码（`lks/ins/ors`）假设值本身不含逗号（包括 `">,35"` 这类比较前缀）；含逗号的值会在参数校验阶段被**明确拒绝并指向** `db_query_sql` 参数绑定，不再返回含糊的 `ors is wrong`。
 - jsonfile 的 `lks` 是子串匹配；`%` 通配符会被剥离后近似处理。
-- `db_query_sql` 的 `EXPLAIN` 已在 mysql 适配（先执行再取结果元数据）；其它方言按各自支持面。
+- **jsonfile 的原始 SQL 只支持 `select … from <table>`**（条件走 `params`，见 `db_query` 的 `lks/ins/ors`）。带 WHERE / JOIN / 聚合 / ORDER BY / LIMIT 的语句、以及不存在的表，一律返回**明确错误**（2026-10-22 实地报告 F4）；旧版返回 `status:202 data:[]` 会让模型误判为"没有这条数据"。
+- `db_query_sql` 的 `EXPLAIN` 已在 mysql 适配（先执行再取结果元数据）；其它方言按各自支持面。`WITH`/`EXPLAIN` 的语句体会检查 DML 关键字，数据修改型 CTE 与 `EXPLAIN ANALYZE <写>` 被拒绝。
+- dm8 取数循环只把 `DSQL_SUCCEEDED` 当作"还有一行"，取数错误立即返回（不再无限 push 空对象）；单次查询上限 100000 行，超出返回明确错误。
+- `db_query_sql` 的只读闸门是**语句级**的（白名单 + 语句体 DML 检测）。它不建立引擎级只读会话——`db_exec_sql` 与结构化写工具共用同一连接池，连接级只读会连带禁止写工具。需要物理隔离时，把只读探索指向只读账号的实例。

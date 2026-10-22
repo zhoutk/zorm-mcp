@@ -112,6 +112,16 @@ Key architectural facts:
   member becomes a shared-mutable-state problem — keep the default 1 unless that is addressed.
   `App::db(name)` returns the backend or `nullptr` — every tool validates `db` first and the error
   lists the available backend names (self-correcting design).
+- **`db_query_sql` is read-only at the STATEMENT level.** `checkReadOnlySql` (sql_tools.cpp) allows
+  SELECT/WITH/PRAGMA/SHOW/EXPLAIN/DESCRIBE and then masks comments/quoted text and scans the body:
+  a data-modifying CTE (`WITH … DELETE/UPDATE/INSERT`) or `EXPLAIN ANALYZE <write>` is rejected
+  (the latter really executes on PostgreSQL). There is deliberately no engine-level read-only
+  session: write tools share the same pool, so `SET SESSION … READ ONLY` would break them. Keep this
+  in mind when adding a backend — the gate is the security boundary, not the engine.
+- **jsonfile's raw SQL subset is `select … from <table>` only** (conditions go through `params`).
+  Everything else returns an explicit error; never restore the old "202 empty result" fallback — an
+  AI reads that as "no such row" (silent false negative).
+
 - **MRTR is centralized.** All writes funnel through `stageWrite(ctx, kind)` (in `data_tools.cpp`,
   reused by `sql_tools.cpp`). First call returns `input_required` + a `requestState` sealed by
   `mcp-cpp`'s `RequestStateCodec` (HMAC, bound to the tool name; bound to the Bearer principal over

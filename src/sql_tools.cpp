@@ -10,6 +10,7 @@
 
 #include <cctype>
 #include <string>
+#include <vector>
 
 namespace zorm_mcp {
 
@@ -21,6 +22,117 @@ using mcp::server::Ctx;
 
 namespace {
 
+// Blanks out everything whose CONTENT is not SQL syntax: string literals,
+// quoted identifiers, and comments. Keyword analysis then cannot be fooled by
+// "select 'delete from t'" or by a column literally named "update". The mask
+// preserves offsets/length; only bytes become spaces (newlines stay, so line
+// comments terminate correctly).
+std::string maskNonCode(const std::string& sql) {
+  std::string out = sql;
+  size_t i = 0;
+  while (i < out.size()) {
+    const char c = out[i];
+    if (c == '-' && i + 1 < out.size() && out[i + 1] == '-') {
+      while (i < out.size() && out[i] != '\n') out[i++] = ' ';
+      continue;
+    }
+    if (c == '/' && i + 1 < out.size() && out[i + 1] == '*') {
+      out[i++] = ' ';
+      out[i++] = ' ';
+      while (i < out.size()) {
+        if (out[i] == '*' && i + 1 < out.size() && out[i + 1] == '/') {
+          out[i++] = ' ';
+          out[i++] = ' ';
+          break;
+        }
+        if (out[i] != '\n') out[i] = ' ';
+        ++i;
+      }
+      continue;
+    }
+    if (c == '\'' || c == '"' || c == '`') {
+      const char quote = c;
+      out[i++] = ' ';
+      while (i < out.size()) {
+        if (out[i] == quote) {
+          // Doubled quote is an escaped quote inside the literal.
+          if (i + 1 < out.size() && out[i + 1] == quote) {
+            out[i++] = ' ';
+            out[i++] = ' ';
+            continue;
+          }
+          out[i++] = ' ';
+          break;
+        }
+        if (out[i] != '\n') out[i] = ' ';
+        ++i;
+      }
+      continue;
+    }
+    if (c == '[') {  // sqlite/tsql bracket identifier
+      out[i++] = ' ';
+      while (i < out.size()) {
+        if (out[i] == ']') {
+          out[i++] = ' ';
+          break;
+        }
+        if (out[i] != '\n') out[i] = ' ';
+        ++i;
+      }
+      continue;
+    }
+    ++i;
+  }
+  return out;
+}
+
+std::vector<std::string> sqlWords(const std::string& masked) {
+  std::vector<std::string> words;
+  std::string cur;
+  for (const char ch : masked) {
+    const unsigned char u = static_cast<unsigned char>(ch);
+    if (std::isalnum(u) || ch == '_') {
+      cur.push_back(static_cast<char>(std::tolower(u)));
+    } else if (!cur.empty()) {
+      words.push_back(cur);
+      cur.clear();
+    }
+  }
+  if (!cur.empty()) words.push_back(cur);
+  return words;
+}
+
+bool isDmlWord(const std::string& w, const std::string& next) {
+  // REPLACE is also a scalar function (REPLACE(str, a, b)), so only the
+  // statement form "REPLACE INTO" counts as a write.
+  if (w == "replace") return next == "into";
+  return w == "insert" || w == "update" || w == "delete" || w == "merge";
+}
+
+// Returns the first DML keyword in the statement ("" when none). Used for
+// WITH and EXPLAIN, whose first keyword alone says nothing about the body.
+std::string firstDmlWord(const std::vector<std::string>& words) {
+  for (size_t i = 0; i < words.size(); ++i) {
+    const std::string next = i + 1 < words.size() ? words[i + 1] : "";
+    if (isDmlWord(words[i], next)) return words[i];
+  }
+  return "";
+}
+
+// The statement a plan wraps: first SELECT/WITH/DML token after EXPLAIN,
+// skipping its modifier clause ("ANALYZE", "VERBOSE", "QUERY PLAN",
+// "(ANALYZE, FORMAT JSON)", ...). Returns "" when no statement keyword exists
+// (harmless - nothing can be written without one).
+std::string explainedStatementKind(const std::vector<std::string>& words) {
+  for (size_t i = 1; i < words.size(); ++i) {
+    const std::string& w = words[i];
+    const std::string next = i + 1 < words.size() ? words[i + 1] : "";
+    if (w == "select" || w == "with") return w;
+    if (isDmlWord(w, next)) return w;
+  }
+  return "";
+}
+
 McpResult<Json> unknownDb(const std::string& dbName) {
   return mcp::Err(McpErrorCode::InvalidParams,
                   "unknown db: " + dbName + " (available: " + app().dbListText() +
@@ -30,7 +142,13 @@ McpResult<Json> unknownDb(const std::string& dbName) {
 // Read-only statement gate. Allowed first keywords: SELECT / WITH (read
 // queries and CTEs), PRAGMA / SHOW / EXPLAIN / DESCRIBE / DESC (introspection
 // and plans). Semicolons are rejected outright - one statement per call, no
-// statement smuggling. Anything else belongs in db_exec_sql (if enabled).
+// statement smuggling.
+//
+// WITH and EXPLAIN get a SECOND check because their first keyword proves
+// nothing: "WITH c AS (SELECT 1) DELETE FROM t" and "EXPLAIN ANALYZE UPDATE"
+// both write data (the latter on PostgreSQL) while looking like introspection.
+// The body is scanned for a DML keyword after masking comments and quoted
+// text. Anything that fails belongs in db_exec_sql (if enabled).
 McpResult<Json> checkReadOnlySql(const std::string& sql) {
   size_t i = 0;
   // Skip leading whitespace AND comments: "/* c */ select 1" is a read
@@ -72,6 +190,49 @@ McpResult<Json> checkReadOnlySql(const std::string& sql) {
                         "db_query_sql is READ-ONLY and accepts a single statement "
                         "(no ';'). Multi-statement work belongs in db_trans, write "
                         "SQL in db_exec_sql (--allow-sql)");
+      }
+      // The first keyword alone is NOT enough: "WITH c AS (...) DELETE" and
+      // "EXPLAIN ANALYZE UPDATE" both hit the database for real. Analyze the
+      // statement body (comments/literals masked out so they cannot hide it).
+      const std::string masked = maskNonCode(sql);
+      const std::vector<std::string> words = sqlWords(masked);
+      const std::string first = std::string(kw);
+      if (first == "with" || first == "explain") {
+        std::string dml;
+        if (first == "with") {
+          dml = firstDmlWord(words);
+        } else {
+          const std::string kind = explainedStatementKind(words);
+          if (isDmlWord(kind, "")) {
+            dml = kind;
+          } else if (kind == "with") {
+            dml = firstDmlWord(words);
+          }
+        }
+        if (!dml.empty()) {
+          return mcp::Err(
+              McpErrorCode::InvalidParams,
+              "db_query_sql is READ-ONLY: '" + first + " ... " + dml +
+                  "' executes a write" +
+                  (first == "explain"
+                       ? " (EXPLAIN ANALYZE actually runs the statement)"
+                       : " (a data-modifying CTE)") +
+                  ". Use db_insert / db_update / db_delete / db_trans, or "
+                  "db_exec_sql when the server runs with --allow-sql");
+        }
+      }
+      // SELECT ... INTO OUTFILE/DUMPFILE writes files on MySQL.
+      if (first == "select") {
+        for (size_t w = 0; w + 1 < words.size(); ++w) {
+          if (words[w] == "into" &&
+              (words[w + 1] == "outfile" || words[w + 1] == "dumpfile")) {
+            return mcp::Err(McpErrorCode::InvalidParams,
+                            "db_query_sql is READ-ONLY: SELECT ... INTO " +
+                                words[w + 1] +
+                                " writes a file. Use a structured write tool or "
+                                "db_exec_sql (--allow-sql)");
+          }
+        }
       }
       return mcp::Ok(Json());
     }
@@ -146,7 +307,7 @@ McpResult<Json> toolExecSql(Ctx& c) {
 McpResult<Json> toolTrans(Ctx& c) { return stageWrite(c, "trans"); }
 
 void registerSqlTools(mcp::server::Builder& b) {
-  b.tool(Json(R"json({"name":"db_query_sql","description":"Ad-hoc READ-ONLY SQL for what db_query cannot express: JOINs, dialect functions, EXPLAIN plans. Only SELECT / WITH / PRAGMA / SHOW / EXPLAIN / DESCRIBE, one statement, no ';'. Bind values via the values array (? placeholders, in order) instead of string concatenation. Writes belong in db_insert / db_update / db_delete / db_trans.","inputSchema":{"type":"object","required":["db","sql"],"properties":{"db":{"type":"string","description":"backend name"},"sql":{"type":"string","description":"single read-only statement"},"values":{"type":"array","items":{},"description":"positional bindings for ? placeholders"},"params":{"type":"object","description":"named parameters (zorm querySql semantics)"}}}})json"),
+  b.tool(Json(R"json({"name":"db_query_sql","description":"Ad-hoc READ-ONLY SQL for what db_query cannot express: JOINs, dialect functions, EXPLAIN plans. Only SELECT / WITH / PRAGMA / SHOW / EXPLAIN / DESCRIBE, one statement, no ';'. WITH and EXPLAIN bodies are checked for DML: 'WITH ... DELETE/UPDATE/INSERT' and 'EXPLAIN ANALYZE <write>' are rejected because they execute writes. Bind values via the values array (? placeholders, in order) instead of string concatenation. Writes belong in db_insert / db_update / db_delete / db_trans.","inputSchema":{"type":"object","required":["db","sql"],"properties":{"db":{"type":"string","description":"backend name"},"sql":{"type":"string","description":"single read-only statement"},"values":{"type":"array","items":{},"description":"positional bindings for ? placeholders"},"params":{"type":"object","description":"named parameters (zorm querySql semantics)"}}}})json"),
          toolQuerySql);
   b.tool(Json(R"({"name":"db_trans","description":"ATOMIC multi-statement transaction (MRTR-confirmed). sqls is a non-empty array; each element is either {\"text\": \"sql\", \"values\": [...]} (or \"sql\" instead of \"text\") or structured {\"table\", \"method\": \"insert\"|\"update\"|\"delete\"|\"batch\", \"params\": {...}, \"id\": v}. All statements commit together or all roll back. This is also the escape hatch for condition-based updates/deletes that the single-row write tools cannot express.","inputSchema":{"type":"object","required":["db","sqls"],"properties":{"db":{"type":"string"},"sqls":{"type":"array","items":{"type":"object"},"minItems":1}}}})"),
          toolTrans);

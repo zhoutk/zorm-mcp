@@ -843,6 +843,129 @@ TEST(ZormMcpE2E, ReportedDefectRegressions) {
       std::filesystem::current_path() / "zorm-mcp-data.json"));
 }
 
+// Regressions from the 2026-10-22 field report (F1/F3/F5/F6/O1). F2/F4/F7 live
+// in zorm (dm8 fetch loop, jsonfile SQL subset, dm8 diagnostic output).
+TEST(ZormMcpE2E, FieldReport20261022Regressions) {
+  Child child = spawnChild(false, true);  // --yes --allow-sql
+  PipeTransport t(child);
+  Client client("e2e", "1.0");
+  client.connect(t);
+  ASSERT_NO_FATAL_FAILURE(resetTable(client));
+
+  for (const char* id : {"f1a", "f1b", "f1c"}) {
+    Json ins = argsWith("sqlite3");
+    ins.add("table", Json::str("t_e2e"));
+    ins.add("data", Json(std::string(R"({"id":")") + id +
+                         R"(","name":"n","score":10})"));
+    ASSERT_TRUE(client.callTool("db_insert", ins).has_value());
+  }
+
+  auto querySql = [&](const char* sql) {
+    return client.callTool("db_query_sql",
+                           Json(std::string(R"({"db":"sqlite3","sql":")") + sql +
+                                R"("})"));
+  };
+
+  // F1: the first keyword proves nothing. Data-modifying CTEs and EXPLAIN
+  // ANALYZE (which really runs the statement on PostgreSQL) must be rejected
+  // by the gate, not merely by the engine.
+  for (const char* sql : {
+           "with c as (select 1 as x) delete from t_e2e",
+           "with c as (select 1 as x) update t_e2e set score = 0",
+           "with c as (select 1 as x) insert into t_e2e (id) values ('f1z')",
+           "explain analyze update t_e2e set score = 0",
+           "explain analyze delete from t_e2e"}) {
+    auto rs = querySql(sql);
+    ASSERT_FALSE(rs.has_value()) << sql;
+    EXPECT_NE(rs.error().message.find("READ-ONLY"), std::string::npos) << sql;
+  }
+  // The same words inside literals/comments are not statements.
+  for (const char* sql : {
+           "with c as (select 1 as x) select * from c",
+           "select 'delete from t_e2e' as s",
+           "/* delete from t_e2e */ select 1 as s",
+           "select replace('abc','b','x') as s"}) {
+    auto rs = querySql(sql);
+    EXPECT_TRUE(rs.has_value()) << sql << ": " << rs.error().message;
+  }
+  EXPECT_EQ(countOf(client, "sqlite3", "t_e2e"), 3);
+
+  // F3: more than one aggregate produced illegal SQL ("... as total count(*)
+  // as n" - missing comma). Multi-metric analysis is a primary use case.
+  auto multi = client.callTool(
+      "db_query",
+      Json(R"({"db":"sqlite3","table":"t_e2e","group":["name"],"sum":"score,total","count":"id,n"})"));
+  ASSERT_TRUE(multi.has_value()) << multi.error().message;
+  ASSERT_EQ(member(*multi, "data").size(), 1u) << multi->toString();
+  EXPECT_EQ((*multi)["data"][0]["total"].toInt64(), 30);
+  EXPECT_EQ((*multi)["data"][0]["n"].toInt64(), 3);
+  auto twoSums = client.callTool(
+      "db_query",
+      Json(R"({"db":"sqlite3","table":"t_e2e","sum":"score,total,score,double"})"));
+  ASSERT_TRUE(twoSums.has_value()) << twoSums.error().message;
+  EXPECT_TRUE((*twoSums)["data"][0]["double"].isNumber()) << twoSums->toString();
+  auto twoCounts = client.callTool(
+      "db_query",
+      Json(R"({"db":"sqlite3","table":"t_e2e","count":"id,n,score,m"})"));
+  ASSERT_TRUE(twoCounts.has_value()) << twoCounts.error().message;
+  EXPECT_EQ((*twoCounts)["data"][0]["m"].toInt64(), 3);
+
+  // F5: the spec's resource-template ref carries only `uri`; completion must
+  // work without the non-standard ref.name.
+  auto byUri = client.complete(
+      Json(R"j({"type":"ref/resource","uri":"db://schema/{db}"})j"),
+      Json(R"j({"name":"db","value":"sql"})j"));
+  ASSERT_TRUE(byUri.has_value()) << byUri.error().message;
+  EXPECT_NE(byUri->toString().find("sqlite3"), std::string::npos)
+      << byUri->toString();
+  auto tableByUri = client.complete(
+      Json(R"j({"type":"ref/resource","uri":"db://schema/{db}/{table}"})j"),
+      Json(R"j({"name":"table","value":"t_e"})j"));
+  ASSERT_TRUE(tableByUri.has_value()) << tableByUri.error().message;
+  EXPECT_NE(tableByUri->toString().find("t_e2e"), std::string::npos)
+      << tableByUri->toString();
+
+  // O1: a comma inside an ors/lks/ins value cannot ride the pair encoding -
+  // say why and point at db_query_sql, do not answer "ors is wrong".
+  auto comma = client.callTool(
+      "db_query", Json(R"({"db":"sqlite3","table":"t_e2e","ors":{"score":">,35"}})"));
+  ASSERT_FALSE(comma.has_value());
+  EXPECT_NE(comma.error().message.find("contains a comma"), std::string::npos)
+      << comma.error().message;
+  EXPECT_NE(comma.error().message.find("db_query_sql"), std::string::npos);
+
+  // F4 (tool layer): jsonfile's SQL subset is explicit, never a silent [].
+  auto jfWhere = client.callTool(
+      "db_query_sql",
+      Json(R"({"db":"jsonfile","sql":"select * from t_e2e_json where name = 'ada'"})"));
+  ASSERT_FALSE(jfWhere.has_value());
+  EXPECT_NE(jfWhere.error().message.find("supports only"), std::string::npos)
+      << jfWhere.error().message;
+  auto jfMissing = client.callTool(
+      "db_query_sql", Json(R"({"db":"jsonfile","sql":"select * from no_such_jf"})"));
+  ASSERT_FALSE(jfMissing.has_value());
+  EXPECT_NE(jfMissing.error().message.find("unknown table"), std::string::npos)
+      << jfMissing.error().message;
+}
+
+// F6: a db_delete WHERE the tool cannot express must be rejected while STAGING,
+// so the user is never asked to approve an operation that can only fail.
+TEST(ZormMcpE2E, DeleteConditionRejectedBeforeConfirmation) {
+  Child child = spawnChild(true, false);  // MRTR confirmation ON
+  PipeTransport t(child);
+  Client client("e2e", "1.0");
+  client.connect(t);
+
+  auto rs = client.callTool(
+      "db_delete", Json(R"({"db":"sqlite3","table":"t_e2e","where":{"score":10}})"));
+  ASSERT_FALSE(rs.has_value()) << rs->toString();
+  EXPECT_EQ(rs.error().code, McpErrorCode::InvalidParams);
+  EXPECT_NE(rs.error().message.find("supports only where"), std::string::npos)
+      << rs.error().message;
+  // Not an input_required result: nothing was staged for the user to approve.
+  EXPECT_EQ(rs.error().message.find("Confirm"), std::string::npos);
+}
+
 // ---- the open-box jsonfile backend (same semantics, no SQL) ----------------------
 
 TEST(ZormMcpE2E, JsonfileParity) {
