@@ -22,6 +22,14 @@
         "D:\\codes\\zorm-mcp"
       ],
       "type": "stdio"
+    },
+    "zorm-mcp": {
+      "command": "cmd.exe",
+      "args": [
+        "/c",
+        "D:\\codes\\zorm-mcp\\start.cmd"
+      ],
+      "type": "stdio"
     }
   }
 }
