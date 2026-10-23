@@ -9,7 +9,7 @@
 >
 > **总判定：通过。** 7 组测试共 **283 项断言全部通过**（runner1 35 + runner2 97 + runner3 40
 > + runner4 37 + runner5 17 + runner6 45 + runner7 6，外加真实客户端 8 次调用抽查），
-> 另沉淀 **9 条发现**（无 Critical/High，3 条 P3，其余为文档/UI 细节，见 §6）。
+> 另沉淀 **10 条发现**（无 Critical/High，见 §6）。修复回归见 §6.1（298 项断言全绿）。
 
 ## 1. 测试环境
 
@@ -139,6 +139,60 @@
 
 > F-1/F-8/F-9 建议进近期的改进列表；其余为文档或 5 分钟级小项。无安全类发现。
 
+### F-11（手册复现途中新发现，p3，已修复）
+
+撰写 [HANDS-ON-TEST-GUIDE.md](HANDS-ON-TEST-GUIDE.md) 并按其五后端逐项核对时发现：
+F-4 的 `*`→`total` 别名默认只改了**生成端**（`convertStringLists`），`aggregateAliases`
+（dm8 字符串聚合→数字归一化，D-12）未同步，导致 dm8 上 `count:"*"/["*"]/{ "*":"" }`
+返回 JSON **字符串** `"3"` 而非数字。`data_tools.cpp aggregateAliases` 已对齐同一默认别名
+（一行改动），**五后端 15×5=75 项语义核对 + 全部 9 套回归 318 项断言 0 失败**（见 §6.1 与
+`.tmp-field/ft3/probe11_guidecheck.py`）。
+
+## 6.1 修复回归（2026-10-23 下午，提交 dcefe72/dcefe71 审核后追加）
+
+提交 `dcefe71`（"Address the 2026-10-23 field report findings (F-1 to F-10)"，
+含 `thirds/zorm` 指针 `0a4b812 → 01d8e48`）已针对本清单修复并补充 e2e
+（`ZormMcpE2E.FieldReport20261023Findings`）。审核结论与独立回归结果如下。
+
+### 审核结论（代码 diff + 子模块 commit 01d8e48）
+
+| 项 | 处置 | 审核意见 |
+| --- | --- | --- |
+| F-1 | `toolCount` 未知顶层键 → `InvalidParams`（点名键并给出 `where` 形状）| ✔ 正确；白名单式（db/table/where + 3 个协议重试字段），不破坏 MRTR 重试 |
+| F-2 | zorm `01d8e48`：功能型 PRAGMA 从语句取列名，行数据恢复 | ✔ 正确；TVF 与旧路径均保留 |
+| F-3 | 文档化（`docs/dialects.md` §5） | ✔ 措辞准确（裸名落登录 schema + 大写折叠，列亦须引号小写） |
+| F-4 | 匿名 `*`（字符串/数组/`{col:""}`）别名 `total`；显式别名不变 | ✔ 实现最小且向后兼容 |
+| F-5 | `db_exec_sql` description 增补 affected-count 语义 | ✔ |
+| F-6 | `--http`/`--sse-keepalive` 严格数字解析，非法 exit 2；含上界（端口 1..65535、keepalive ≤86400000ms）| ✔ 比建议更进一步（范围检查） |
+| F-7 | 文档化（INTEGRATION.md 故障排查节） | ✔ |
+| F-8 | zorm dm8 transGo 透传驱动诊断文本 | ✔ 错误文本非空且 GBK→UTF8 正常 |
+| F-9 | zorm sqlite 错误附驱动明细（`Error Code : 20 (datatype mismatch)`）| ✔ 自纠错闭环 |
+| F-10 | 确认文案单复数（`1 statement` / `2 statements`） | ✔ |
+
+**F-11（后记）**：手册复现核对发现 `aggregateAliases` 未同步 F-4 的 `*`→`total` 默认，
+dm8 上匿名 count 返回字符串 —— 已修复并全量回归（见下文 §6.1 末行）。
+
+无已知副作用面被触碰：MRTR 封签/待处理表、只读门、标识符校验、通知 fan-out 均未改动语义。
+
+### 独立回归（本报告 harness，relink 后二进制 sha256 `299a1049…`，ctest 3/3 + zorm ./run-test all 13/13）
+
+| 回归 | 结果 |
+| --- | --- |
+| runner1 协议面 | 35/35 ✓ |
+| runner2 数据工具（F-1/F-2 断言翻转为正向） | 97/97 ✓ |
+| runner3 MRTR 对抗矩阵 | 40/40 ✓ |
+| runner4 --allow-sql/通知/cwd/配置误用/CLI | 37/37 ✓ |
+| runner5 HTTP 传输 | 17/17 ✓ |
+| runner6 远端矩阵（F-8 断言翻转为正向） | 46/46 ✓ |
+| runner7 HTTP MRTR principal 绑定（F-6 断言翻转） | 6/6 ✓ |
+| **fix-verify（run8）：六项修复的正向验证** | **20/20 ✓** |
+| **gate-sweep（run9）：13 条历史 bypass 仍拒 + 8 条合法语句仍放** | **25/25 ✓** |
+| 真实客户端抽查（重建链接前，行为已生效）：F-1 拒绝/合法 where、F-2 PRAGMA 实数据、F-4 `count:*`→total、门拒 CTE-DML/EXPLAIN-CTA | 9/9 ✓ |
+
+F-6 备忘：已注册的 MCP 客户端进程持有旧 exe 句柄时 `ninja` 链接报 `Permission denied`——重启客户端会话（杀掉 `zorm_mcp_server.exe` 子进程）即可重新链接；重建后的 `ctest` 与全部 harness 均在 HEAD 链接二进制上复跑通过。
+
+**F-11 修复后全量回归**（`aggregateAliases` 对齐 `*`→`total` 默认）：runner1–7 + fix-verify + gate-sweep 共 **9 套 318 项断言 0 失败**，`ctest 3/3`。
+
 ## 7. 结论
 
 - **13/13 工具、5/5 后端、双传输**的全部承诺行为在实地复现，未发现阻断/安全/一致性问题。
@@ -146,4 +200,4 @@
 - 三个 P3 发现（F-1/F-2/F-9 之属）属于“参数卫生/错误文案可自纠性”打磨，也与本项目“报错即教学”的设计主张一致，值得尽快补齐；F-3 是 dm8 方言的固有语法约束，建议文档显式化。
 - 复现入口：`.tmp-field/ft3/` 下 `run1_protocol.py … run7_http_mrtr.py`（`python runN.py > runN.out`），harness 及判定均自包含。
 
-（测试执行与证据文件：`.tmp-field/ft3/run*.out`；本报告仅保留 harness 与证据，未改动任何产品代码。）
+（测试执行与证据文件：`.tmp-field/ft3/run*.out`、`regress*.out`；修复回归 harness：`run8_fixverify.py`、`run9_gatesweep.py`。）

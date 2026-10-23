@@ -18,3 +18,8 @@ demo/zorm-mcp/
 *.profraw
 *.profdata
 .tmp-*/
+!.tmp-field/
+.tmp-field/*
+!.tmp-field/ft3/
+.tmp-field/ft3/__pycache__/
+.tmp-field/ft3/*.out

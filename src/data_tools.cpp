@@ -130,8 +130,11 @@ std::optional<std::string> checkAggSpec(const Json& v,
 }
 
 // Aliases produced by sum/count, used to normalize dm8's string-typed
-// aggregate values back to JSON numbers (D-12).
+// aggregate values back to JSON numbers (D-12). The anonymous "*" form is
+// aliased to `total` by convertStringLists (F-4), so the reader side must
+// apply the same default or the normalized column is missed on dm8.
 std::vector<std::string> aggregateAliases(const Json& args) {
+  auto defaultAlias = [](const std::string& col) { return col == "*" ? "total" : col; };
   std::vector<std::string> aliases;
   for (const char* key : {"sum", "count"}) {
     const Json v = member(args, key);
@@ -140,16 +143,16 @@ std::vector<std::string> aggregateAliases(const Json& args) {
       for (const auto& k : v.getAllKeys().toVector()) {
         const std::string col = k.toString();
         const std::string alias = v[col].toString();
-        aliases.push_back(alias.empty() ? col : alias);
+        aliases.push_back(alias.empty() ? defaultAlias(col) : alias);
       }
     } else if (v.isArray()) {
       for (const auto& item : v.toVector()) {
         const auto parts = splitCsv(item.toString());
-        aliases.push_back(trimCopy(parts.size() > 1 ? parts[1] : parts[0]));
+        aliases.push_back(defaultAlias(trimCopy(parts.size() > 1 ? parts[1] : parts[0])));
       }
     } else {
       const auto parts = splitCsv(v.toString());
-      if (parts.size() == 1) aliases.push_back(trimCopy(parts[0]));
+      if (parts.size() == 1) aliases.push_back(defaultAlias(trimCopy(parts[0])));
       for (size_t i = 1; i < parts.size(); i += 2)
         aliases.push_back(trimCopy(parts[i]));
     }
