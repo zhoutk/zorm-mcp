@@ -1,35 +1,4 @@
 {
   "servers": {
-    "code-review-graph": {
-      "command": "D:\\_sys_\\code-review-graph\\Scripts\\code-review-graph.exe",
-      "args": [
-        "serve",
-        "--repo",
-        "D:\\codes\\zorm-mcp",
-        "--auto-watch",
-        "--tools",
-        "build_or_update_graph_tool,get_minimal_context_tool,list_graph_stats_tool,detect_changes_tool,get_impact_radius_tool,get_review_context_tool,get_affected_flows_tool,query_graph_tool,semantic_search_nodes_tool,traverse_graph_tool,get_architecture_overview_tool,find_large_functions_tool,get_docs_section_tool,refactor_tool,apply_refactor_tool"
-      ],
-      "type": "stdio"
-    },
-    "serena": {
-      "command": "D:\\_sys_\\serena\\Scripts\\serena.exe",
-      "args": [
-        "start-mcp-server",
-        "--context",
-        "claude-code",
-        "--project",
-        "D:\\codes\\zorm-mcp"
-      ],
-      "type": "stdio"
-    },
-    "zorm-mcp": {
-      "command": "cmd.exe",
-      "args": [
-        "/c",
-        "D:\\codes\\zorm-mcp\\start.cmd"
-      ],
-      "type": "stdio"
-    }
   }
 }

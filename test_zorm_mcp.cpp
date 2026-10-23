@@ -948,6 +948,73 @@ TEST(ZormMcpE2E, FieldReport20261022Regressions) {
       << jfMissing.error().message;
 }
 
+// Residual vectors from REGRESSION_REPORT_2026-10-22 §5. The gate used to look
+// for a SELECT anywhere after EXPLAIN (so "EXPLAIN ANALYZE CREATE TABLE x AS
+// SELECT" got the SELECT it wanted and PostgreSQL really created the table) and
+// accepted every PRAGMA (so "PRAGMA user_version = 42" persisted to the file).
+// Both are now whitelists: EXPLAIN must wrap SELECT/WITH/VALUES, PRAGMA must be
+// a known read-only name.
+TEST(ZormMcpE2E, ReadOnlyGateResidualVectors) {
+  Child child = spawnChild(false, true);  // --yes --allow-sql
+  PipeTransport t(child);
+  Client client("e2e", "1.0");
+  client.connect(t);
+  ASSERT_NO_FATAL_FAILURE(resetTable(client));
+
+  auto querySql = [&](const char* sql) {
+    return client.callTool(
+        "db_query_sql",
+        Json(std::string(R"({"db":"sqlite3","sql":")") + sql + R"("})"));
+  };
+
+  // R1/R3: EXPLAIN of DDL/DCL/EXECUTE and of DML.
+  for (const char* sql : {
+           "explain create table t_e2e_gate as select 1",
+           "explain analyze create table t_e2e_gate as select 1",
+           "explain analyze create materialized view t_e2e_gate_mv as select 1",
+           "explain analyze execute some_stmt",
+           "explain analyze declare c cursor for select 1",
+           "explain analyze call some_proc()",
+           "explain delete from t_e2e",
+           "explain query plan delete from t_e2e"}) {
+    auto rs = querySql(sql);
+    ASSERT_FALSE(rs.has_value()) << sql;
+    EXPECT_NE(rs.error().message.find("READ-ONLY"), std::string::npos) << sql;
+  }
+  // R2: PRAGMA writes (both '=' and the function-call assignment form).
+  for (const char* sql : {
+           "pragma user_version = 424242",
+           "pragma user_version(424242)",
+           "pragma journal_mode = delete",
+           "pragma journal_mode(wal)",
+           "pragma writable_schema = on",
+           "pragma incremental_vacuum",
+           "pragma optimize"}) {
+    auto rs = querySql(sql);
+    ASSERT_FALSE(rs.has_value()) << sql;
+    EXPECT_NE(rs.error().message.find("READ-ONLY"), std::string::npos) << sql;
+  }
+  // What the gate must keep admitting.
+  for (const char* sql : {
+           "select 1 as x",
+           "explain select 1",
+           "explain query plan select 1",
+           "with c as (select 1 as x) select * from c",
+           "pragma table_info(t_e2e)",
+           "pragma index_list(t_e2e)",
+           "pragma user_version",
+           "pragma database_list"}) {
+    auto rs = querySql(sql);
+    EXPECT_TRUE(rs.has_value()) << sql << ": " << rs.error().message;
+  }
+  // Nothing was created by the rejected DDL above.
+  auto created = querySql(
+      "select name from sqlite_master where name like 't_e2e_gate%'");
+  ASSERT_TRUE(created.has_value()) << created.error().message;
+  EXPECT_EQ(created->toString().find("t_e2e_gate"), std::string::npos)
+      << created->toString();
+}
+
 // F6: a db_delete WHERE the tool cannot express must be rejected while STAGING,
 // so the user is never asked to approve an operation that can only fail.
 TEST(ZormMcpE2E, DeleteConditionRejectedBeforeConfirmation) {

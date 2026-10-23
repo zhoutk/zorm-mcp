@@ -114,8 +114,10 @@ Key architectural facts:
   lists the available backend names (self-correcting design).
 - **`db_query_sql` is read-only at the STATEMENT level.** `checkReadOnlySql` (sql_tools.cpp) allows
   SELECT/WITH/PRAGMA/SHOW/EXPLAIN/DESCRIBE and then masks comments/quoted text and scans the body:
-  a data-modifying CTE (`WITH … DELETE/UPDATE/INSERT`) or `EXPLAIN ANALYZE <write>` is rejected
-  (the latter really executes on PostgreSQL). There is deliberately no engine-level read-only
+  a data-modifying CTE (`WITH … DELETE/UPDATE/INSERT`) is rejected, and `EXPLAIN` must wrap
+  SELECT/WITH/VALUES (`EXPLAIN ANALYZE CREATE TABLE AS`, `EXECUTE`, `CALL` and DML really execute
+  on PostgreSQL); `PRAGMA` is limited to a read-only name list (assignments such as
+  `PRAGMA user_version = 42` are rejected). There is deliberately no engine-level read-only
   session: write tools share the same pool, so `SET SESSION … READ ONLY` would break them. Keep this
   in mind when adding a backend — the gate is the security boundary, not the engine.
 - **jsonfile's raw SQL subset is `select … from <table>` only** (conditions go through `params`).

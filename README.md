@@ -74,7 +74,7 @@ claude mcp add zorm-mcp -- D:/codes/zorm-mcp/start.sh --config D:/codes/zorm-mcp
 | `db_info` {db} | | querySql(内部) | 后端类型 / 服务器版本 / 连通性 |
 | `db_query` {db, table, …} | | select | 智能查询：fields / lks / ins / ors / group / sum / count / sort / page / size + 列条件（`{price:">,100"}` 比较前缀）。`ins:{age:[18,20]}` = 单列多值；`count/sum:"col,alias"` 或 `{col:alias}`；`size` 可单独用（默认 page=1），`page` 必须与 `size` 同时给 |
 | `db_count` {db, table, where?} | | select | 计数 |
-| `db_query_sql` {db, sql, values?} | | querySql | 参数化**只读** SQL（SELECT/WITH/PRAGMA/SHOW/EXPLAIN；JOIN/方言函数/EXPLAIN 的出口）。`values` 用 `?` 占位符；postgres 由服务端自动改写为 `$1..$n`。允许前置注释，仍拒绝多语句。**WITH/EXPLAIN 会检查语句体**：`WITH … DELETE/UPDATE/INSERT` 与 `EXPLAIN ANALYZE <写操作>` 会真的落库，一律拒绝（2026-10-22 实地报告 F1） |
+| `db_query_sql` {db, sql, values?} | | querySql | 参数化**只读** SQL（SELECT/WITH/PRAGMA/SHOW/EXPLAIN；JOIN/方言函数/EXPLAIN 的出口）。`values` 用 `?` 占位符；postgres 由服务端自动改写为 `$1..$n`。允许前置注释，仍拒绝多语句。**WITH/EXPLAIN 会检查语句体**：`WITH … DELETE/UPDATE/INSERT` 一律拒绝；`EXPLAIN` 只能包裹 SELECT/WITH/VALUES（`EXPLAIN ANALYZE CREATE TABLE AS`、`EXECUTE`、`CALL`、DML 都会真的执行）。`PRAGMA` 仅放行只读形态（`table_info`/`index_list`/`user_version`/`journal_mode` 等），赋值形态需 `db_exec_sql`（2026-10-22 实地报告 F1 + 回归报告 R1/R2/R3） |
 | `db_insert` {db, table, data} | ✅MRTR | create | 单行插入（缺 id 自动生成） |
 | `db_insert_batch` {db, table, rows, constraint?} | ✅MRTR | insertBatch | 多行 upsert（冲突列默认 id） |
 | `db_update` {db, table, data, where:{id}} | ✅MRTR | update | 单行更新 |
