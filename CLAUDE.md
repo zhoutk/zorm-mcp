@@ -76,6 +76,24 @@ Committing inside the submodule alone leaves this repo pointing at the old revis
 `git submodule update` would revert it) — `sync-thirds.sh` exists to fix exactly that. mcp-cpp is
 protocol-faithful: do not modify it for application needs.
 
+**Submodule URLs are RELATIVE (`../zorm`, `../mcp-cpp`) on purpose.** This repo is mirrored on more
+than one host (`origin` = self-hosted Gitea, `g` = GitHub), and `.gitmodules` can carry only one
+URL — an absolute one would pin clones *and* the host's web-UI submodule link to that single host.
+A relative URL is resolved by git against the superproject's own remote, so the same commit clones
+correctly from every mirror and both web UIs link to their own sibling repo:
+
+| Superproject cloned from | `../zorm` resolves to |
+| --- | --- |
+| `ssh://git@10.0.0.3:33/zhoutk/zorm-mcp.git` | `ssh://git@10.0.0.3:33/zhoutk/zorm` |
+| `git@github.com:zhoutk/zorm-mcp.git` | `git@github.com:zhoutk/zorm` |
+| `https://github.com/zhoutk/zorm-mcp.git` | `https://github.com/zhoutk/zorm` |
+
+GitHub renders clickable submodule links only for the documented forms `../{repo}` (same owner) or
+`../{owner}/{repo}` (different owner) — hence no `.git` suffix. After editing `.gitmodules`, run
+`git submodule sync` so the already-initialised submodules pick up the re-resolved URL. Adding a
+third mirror needs **no** change here as long as it keeps the `owner/repo` layout; if it does not,
+use `../{owner}/{repo}` instead.
+
 ## Source layout (`src/`, ~1.8k lines)
 
 | File | Role |
