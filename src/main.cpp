@@ -91,7 +91,7 @@ std::shared_ptr<Server> buildServer() {
   zorm_mcp::registerSqlTools(b);
   if (g.allowSql) {
     // Raw write/DDL SQL: operator opt-in, MRTR-confirmed when enabled.
-    b.tool(Json(R"({"name":"db_exec_sql","description":"Execute ARBITRARY write/DDL SQL (INSERT/UPDATE/DELETE/CREATE/...), MRTR-confirmed. Use only for what the structured tools cannot express (schema changes, bulk conditional ops). Prefer db_query_sql for reads and db_trans for atomic batches. Bind values via values array (? placeholders) rather than concatenating them into sql.","inputSchema":{"type":"object","required":["db","sql"],"properties":{"db":{"type":"string","description":"backend name"},"sql":{"type":"string"},"values":{"type":"array","items":{},"description":"positional bindings for ? placeholders"}}}})"),
+    b.tool(Json(R"({"name":"db_exec_sql","description":"Execute ARBITRARY write/DDL SQL (INSERT/UPDATE/DELETE/CREATE/...), MRTR-confirmed. Use only for what the structured tools cannot express (schema changes, bulk conditional ops). It reports affected row counts, NOT result rows: a SELECT here returns affected:1 and no data - read with db_query_sql instead. Prefer db_trans for atomic batches. Bind values via values array (? placeholders) rather than concatenating them into sql.","inputSchema":{"type":"object","required":["db","sql"],"properties":{"db":{"type":"string","description":"backend name"},"sql":{"type":"string"},"values":{"type":"array","items":{},"description":"positional bindings for ? placeholders"}}}})"),
            [](Ctx& c) { return zorm_mcp::stageWrite(c, "exec_sql"); });
   }
   zorm_mcp::registerResourcesAndCompletion(b);
@@ -100,6 +100,26 @@ std::shared_ptr<Server> buildServer() {
   auto server = b.build();
   g.server = server;
   return server;
+}
+
+}  // namespace
+
+namespace {
+
+// atoi() turns "bogus" into 0 - which silently DISABLES --sse-keepalive and
+// would bind an ephemeral --http port. Parse digits only and range-check, so a
+// typo is a startup error instead of a behaviour change.
+bool parseIntArg(const char* s, int& out, long lo, long hi) {
+  if (s == nullptr || *s == '\0') return false;
+  long v = 0;
+  for (const char* p = s; *p != '\0'; ++p) {
+    if (*p < '0' || *p > '9') return false;
+    v = v * 10 + (*p - '0');
+    if (v > hi) return false;
+  }
+  if (v < lo) return false;
+  out = static_cast<int>(v);
+  return true;
 }
 
 }  // namespace
@@ -116,13 +136,21 @@ int main(int argc, char** argv) {
     const std::string a = argv[i];
     if (a == "--http") {
       doHttp = true;
-      if (i + 1 < argc) httpPort = std::atoi(argv[++i]);
+      if (i + 1 >= argc || !parseIntArg(argv[++i], httpPort, 1, 65535)) {
+        std::cerr << "[zorm-mcp] invalid --http: expected a port number 1..65535\n";
+        return 2;
+      }
     } else if (a == "--http-token" && i + 1 < argc) {
       httpTokens.push_back(argv[++i]);
     } else if (a == "--http-origin" && i + 1 < argc) {
       httpOrigin = argv[++i];
-    } else if (a == "--sse-keepalive" && i + 1 < argc) {
-      sseKeepAliveMs = std::atoi(argv[++i]);
+    } else if (a == "--sse-keepalive") {
+      if (i + 1 >= argc ||
+          !parseIntArg(argv[++i], sseKeepAliveMs, 0, 24 * 60 * 60 * 1000)) {
+        std::cerr << "[zorm-mcp] invalid --sse-keepalive: expected milliseconds "
+                     "(0..86400000)\n";
+        return 2;
+      }
     } else if (a == "--yes") {
       g.confirmWrites = false;
     } else if (a == "--allow-sql") {

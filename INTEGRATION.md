@@ -251,5 +251,6 @@ Open WebUI 等只认 OpenAPI 的平台，可用社区 [mcpo](https://github.com/
 - **`db_exec_sql` 看不到**：默认不注册，`--allow-sql` 才暴露——这是刻意设计（结构化写工具已覆盖绝大多数场景）。
 - **客户端日志显示 `Process exited with code 3221225781`（0xC0000135 `STATUS_DLL_NOT_FOUND`）**：exe 同目录缺运行期 DLL——客户端（VS Code、从资源管理器启动的终端等）没有 MSYS2 的 PATH，`libc++.dll`/`libmariadb.dll` 等解析不到。重新构建对应目标，POST_BUILD 会按依赖闭包把 DLL 复制到 exe 目录（正常应看到 `zorm: bundled N resolved runtime DLL(s)`）；不要把 `D:/msys64/clang64/bin` 塞进客户端配置来绕过。
 - **协议兼容性**：stdio/HTTP 均兼容 2024-11-05 → 2026-07-28 全系版本（legacy initialize + 新版 server/discover 双握手）；严格客户端（DSH）验证过 CacheableResult 字段；modern 结果带 `_meta.serverInfo`，资源能力声明 `subscribe`/`listChanged`。
+- **legacy 时代的 `resources/subscribe` 是空 stub**：2024-11-05～2025-11-25 客户端订阅会返回成功，但不会收到按 URI 的 `notifications/resources/updated`；真正的写入通知 fan-out 只在 2026-07-28 的 `subscriptions/listen` 下生效（mcp-cpp 0.4 的 transport 分工）。需要变更通知时请使用 modern 协议。
 - **HTTP 暴露到非本机**：至少加 `--http-token`，并用 `--http-origin` 限制浏览器来源；需要 TLS/多用户时在前面放反向代理。
 - **要长期接生产库**：建议 `--config` 用绝对路径 + 专用的低权限数据库账号（只授业务库权限），不要复用管理员账号。

@@ -1015,6 +1015,74 @@ TEST(ZormMcpE2E, ReadOnlyGateResidualVectors) {
       << created->toString();
 }
 
+// Findings from the 2026-10-23 field report (F-1/F-2/F-4/F-9). Each was a
+// silent or unhelpful behaviour an AI client could misread as success.
+TEST(ZormMcpE2E, FieldReport20261023Findings) {
+  Child child = spawnChild(false, true);  // --yes --allow-sql
+  PipeTransport t(child);
+  Client client("e2e", "1.0");
+  client.connect(t);
+  ASSERT_NO_FATAL_FAILURE(resetTable(client));
+  for (const auto& row : {R"({"id":"a","name":"ada","score":10})",
+                          R"({"id":"b","name":"bob","score":20})",
+                          R"({"id":"c","name":"cy","score":30})"}) {
+    Json ins = argsWith("sqlite3");
+    ins.add("table", Json::str("t_e2e"));
+    ins.add("data", Json(row));
+    ASSERT_TRUE(client.callTool("db_insert", ins).has_value());
+  }
+
+  // F-1: an unknown top-level key used to be dropped silently, so
+  // {"score":10} returned the WHOLE table. It must name the key and the shape.
+  auto dropped = client.callTool(
+      "db_count", Json(R"({"db":"sqlite3","table":"t_e2e","score":10})"));
+  ASSERT_FALSE(dropped.has_value()) << dropped->toString();
+  EXPECT_NE(dropped.error().message.find("unknown argument 'score'"),
+            std::string::npos)
+      << dropped.error().message;
+  EXPECT_NE(dropped.error().message.find("where"), std::string::npos);
+  auto scoped = client.callTool(
+      "db_count", Json(R"({"db":"sqlite3","table":"t_e2e","where":{"score":10}})"));
+  ASSERT_TRUE(scoped.has_value()) << scoped.error().message;
+  EXPECT_EQ((*scoped)["data"][0]["total"].toInt64(), 1);
+
+  // F-2: a functional PRAGMA through db_query_sql used to render every row as
+  // "{}". The columns now come from the prepared statement.
+  auto pragma = client.callTool(
+      "db_query_sql", Json(R"sql({"db":"sqlite3","sql":"pragma table_info(t_e2e)"})sql"));
+  ASSERT_TRUE(pragma.has_value()) << pragma.error().message;
+  EXPECT_NE(pragma->toString().find("\"name\":\"id\""), std::string::npos)
+      << pragma->toString();
+
+  // F-4: the anonymous "*" in all three shapes means count(*) - it used to
+  // generate "count(*) as *" (syntax error). Explicit aliases are unchanged.
+  for (const char* args : {
+           R"({"db":"sqlite3","table":"t_e2e","count":["*"]})",
+           R"({"db":"sqlite3","table":"t_e2e","count":"*"})",
+           R"({"db":"sqlite3","table":"t_e2e","count":{"*":""}})"}) {
+    auto rs = client.callTool("db_query", Json(args));
+    ASSERT_TRUE(rs.has_value()) << args << ": " << rs.error().message;
+    EXPECT_EQ((*rs)["data"][0]["total"].toInt64(), 3) << args;
+  }
+
+  // F-9: the sqlite text error used to be "Error Code : 20" only; the driver
+  // detail makes an INTEGER PRIMARY KEY + generated hex id self-correctable.
+  auto create = client.callTool("db_exec_sql",
+                                Json(R"({"db":"sqlite3","sql":"drop table if exists f9_intpk_e2e"})"));
+  ASSERT_TRUE(create.has_value()) << create.error().message;
+  create = client.callTool(
+      "db_exec_sql",
+      Json(R"sql({"db":"sqlite3","sql":"create table f9_intpk_e2e (id INTEGER PRIMARY KEY, v text)"})sql"));
+  ASSERT_TRUE(create.has_value()) << create.error().message;
+  auto mismatch = client.callTool(
+      "db_insert", Json(R"({"db":"sqlite3","table":"f9_intpk_e2e","data":{"v":"x"}})"));
+  ASSERT_FALSE(mismatch.has_value()) << mismatch->toString();
+  EXPECT_NE(mismatch.error().message.find("datatype mismatch"), std::string::npos)
+      << mismatch.error().message;
+  client.callTool("db_exec_sql",
+                  Json(R"({"db":"sqlite3","sql":"drop table f9_intpk_e2e"})"));
+}
+
 // F6: a db_delete WHERE the tool cannot express must be rejected while STAGING,
 // so the user is never asked to approve an operation that can only fail.
 TEST(ZormMcpE2E, DeleteConditionRejectedBeforeConfirmation) {
@@ -1031,6 +1099,16 @@ TEST(ZormMcpE2E, DeleteConditionRejectedBeforeConfirmation) {
       << rs.error().message;
   // Not an input_required result: nothing was staged for the user to approve.
   EXPECT_EQ(rs.error().message.find("Confirm"), std::string::npos);
+
+  // F-10: a one-element transaction reads "1 statement", not "1 statements".
+  Json tr = argsWith("sqlite3");
+  tr.add("sqls",
+         Json(R"([{"table":"t_e2e","method":"delete","params":{}}])"));
+  auto staged = client.callTool("db_trans", tr);
+  ASSERT_TRUE(staged.has_value()) << staged->toString();
+  EXPECT_NE(staged->toString().find("(1 statement)"), std::string::npos)
+      << staged->toString();
+  EXPECT_EQ(staged->toString().find("1 statements"), std::string::npos);
 }
 
 // ---- the open-box jsonfile backend (same semantics, no SQL) ----------------------

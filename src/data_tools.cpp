@@ -424,6 +424,13 @@ void convertStringLists(const Json& args, ZORM::Json& params, bool stripWildcard
   //   object {col:alias}  -> col,alias (alias defaults to the column)
   //   array  ["col"]      -> col,col   (["col,alias"] passes through)
   //   string "col,alias"  -> unchanged (validated upstream)
+  // `count:"*"` / `count:["*"]` / `count:{"*":""}` mean count(*) - but using
+  // "*" as the DEFAULT ALIAS produced "count(*) as *" (a syntax error on every
+  // backend). The anonymous form aliases to `total` instead; an explicit alias
+  // ("*,n", {"*":"n"}) is untouched.
+  auto aggAlias = [](const std::string& col) -> std::string {
+    return col == "*" ? "total" : col;
+  };
   for (const char* key : {"sum", "count"}) {
     const Json v = member(args, key);
     if (v.isError() || v.isNull()) continue;
@@ -433,7 +440,7 @@ void convertStringLists(const Json& args, ZORM::Json& params, bool stripWildcard
         const std::string kk = k.toString();
         const std::string alias = v[kk].toString();
         if (!joined.empty()) joined += ",";
-        joined += kk + "," + (alias.empty() ? kk : alias);
+        joined += kk + "," + (alias.empty() ? aggAlias(kk) : alias);
       }
       if (!joined.empty()) params.add(key, ZORM::Json(joined.c_str()));
     } else if (v.isArray()) {
@@ -442,14 +449,14 @@ void convertStringLists(const Json& args, ZORM::Json& params, bool stripWildcard
         const std::string s = item.toString();
         if (s.empty()) continue;
         if (!joined.empty()) joined += ",";
-        joined += s.find(',') == std::string::npos ? s + "," + s : s;
+        joined += s.find(',') == std::string::npos ? s + "," + aggAlias(s) : s;
       }
       if (!joined.empty()) params.add(key, ZORM::Json(joined.c_str()));
     } else if (v.isString()) {
       const std::string s = v.toString();
       if (!s.empty())
         params.add(key, ZORM::Json(
-                            (s.find(',') == std::string::npos ? s + "," + s : s)
+                            (s.find(',') == std::string::npos ? s + "," + aggAlias(s) : s)
                                 .c_str()));
     }
   }
@@ -913,7 +920,8 @@ McpResult<Json> stageWrite(Ctx& c, const std::string& kind) {
     } else if (kind == "update") {
       impact = "row id=" + member(member(args, "where"), "id").toString();
     } else if (kind == "trans" && member(args, "sqls").isArray()) {
-      impact = std::to_string(member(args, "sqls").size()) + " statements";
+      const int64_t n = member(args, "sqls").size();
+      impact = std::to_string(n) + (n == 1 ? " statement" : " statements");
     } else if (kind == "exec_sql") {
       impact = "arbitrary SQL";
     }
@@ -1060,6 +1068,20 @@ McpResult<Json> toolCount(Ctx& c) {
     return mcp::Err(McpErrorCode::InvalidParams, "table is required");
   }
   if (auto e = badIdent("table", table)) return invalidArgs(*e);
+
+  // No silent drops: a condition passed OUTSIDE `where` would otherwise be
+  // ignored and the caller would get the whole-table count. Naming the key
+  // and showing the accepted shape is the cheapest correction loop.
+  for (const auto& k : args.getAllKeys().toVector()) {
+    const std::string key = k.toString();
+    if (key == "db" || key == "table" || key == "where") continue;
+    if (key == "requestState" || key == "inputResponses" || key == "approved")
+      continue;  // protocol-level retry fields tolerated by every tool
+    return invalidArgs("unknown argument '" + key +
+                       "': db_count accepts db, table, where. Put conditions "
+                       "inside where, e.g. {\"where\":{\"" +
+                       key + "\":<value>}}");
+  }
 
   // zorm count expects a "col,alias" pair (e.g. "*,total"); optional where
   // keys merge into params as top-level conditions (zorm select semantics).

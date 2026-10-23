@@ -46,11 +46,13 @@ zorm 的 dm8 方言用 `db_name` 作为 **schema** 限定名（`"dbtest"."table"
 - `db_list_tables` / `db_describe_table` / `db_indexes` 查询 `all_*` 目录并过滤 `owner = db_name`，与工具实际访问的对象一致；
 - 如果登录用户的默认 schema 与 `db_name` 不同（例如 SYSDBA），不会再把“另一个 schema 的表”列出来；
 - `db_delete where:{}` 使用同样的限定名。
+- **raw DDL（`db_exec_sql`/`db_trans` 文本元素）必须自己写限定名并给标识符加引号**：`create table ft3_x (...)` 不会报错，但会落在登录用户的 schema（如 `SYSDBA`）且标识符折叠为大写，工具面按 `"dbtest"` 查询时**看不到**它。正确写法：`create table "dbtest"."ft3_x" ("id" varchar(32) primary key, ...)`（列名同样带引号小写）。结构化工具（`db_insert` 等）由 zorm 生成 quoted-lowercase SQL，不受影响。
 
 ## 6. 结果信封归一化
 
 - 写操作同时提供 `affected` 与 `affectedRows`（源字段缺失时互补）。
 - `db_count` 与 `db_query` 的 `sum/count` 别名值统一为 JSON 数字（dm8 驱动返回字符串）。
+- `count` 的匿名 `*` 形式（`count:"*"`、`count:["*"]`、`count:{"*":""}`）别名为 `total`，不会生成非法的 `count(*) as *`；显式别名（`"*,n"`、`{"*":"n"}`）保持不变。
 - 多行 `db_insert_batch` 不再返回单个 `insertId`。
 - 文件型后端（sqlite3/jsonfile）的错误附加 `[file: 绝对路径]`；服务型后端（mysql/pg/dm8）不再附加误导性的仓库根路径。
 - dm8 的 GBK 错误文本在返回前转 UTF-8（已是 UTF-8 的保持不变）。
